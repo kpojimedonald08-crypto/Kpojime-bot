@@ -129,7 +129,7 @@ def macd_aligned(candles, direction):
 
 # ── LEVELS ────────────────────────────────────────────────
 def levels(entry, direction, bos_wick):
-    buffer = 3.0
+    buffer = 10.0
     if direction == "BEARISH":
         sl   = bos_wick + buffer
         risk = sl - entry
