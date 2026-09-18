@@ -169,7 +169,11 @@ def scan():
     h1_bos, h1_wick, _ = bos(h1, h4b)
     print(f"H1 BOS: {h1_bos}")
     if not h1_bos: return
-
+    current_price = m5[0]["c"]
+        tolerance = 5.0
+        if abs(current_price - h1_wick) > tolerance:
+            print("Price not at BOS level - waiting")
+            return
     if bias(m15) != h4b: print("M15 not aligned"); return
     if not macd_aligned(h1, h4b): print("MACD conflict"); return
     if not m5_trigger(m5, h4b): print("M5 not triggered"); return
