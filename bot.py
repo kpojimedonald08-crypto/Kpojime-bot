@@ -185,7 +185,15 @@ def scan():
     risk = abs(entry - sl)
     rr2  = round(abs(tp2 - entry) / risk, 1) if risk > 0 else 0
     emoji = "🔴" if direction == "SELL" else "🟢"
-
+    highs = [c["h"] for c in h1[:20]]
+        lows = [c["l"] for c in h1[:20]]
+        resistance = max(highs)
+        support = min(lows)
+        sr_warning = ""
+        if h4b == "BULLISH" and (resistance - entry) < 20:
+            sr_warning = f"\n⚠️ APPROACHING RESISTANCE at {resistance:.2f}"
+        if h4b == "BEARISH" and (entry - support) < 20:
+            sr_warning = f"\n⚠️ APPROACHING SUPPORT at {support:.2f}"
     msg = (
         f"{emoji} SIGNAL ALERT — XAU/USD\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -204,6 +212,7 @@ def scan():
         f"R:R (TP2) : 1:{rr2}\n"
         f"Time      : {now_str}\n"
         f"━━━━━━━━━━━━━━━━\n"
+       f"{sr_warning}\n"
         f"⚠️ Confirm on chart. Use 2% risk."
     )
     send(msg)
