@@ -69,30 +69,33 @@ def fetch(symbol, interval, count=30):
 
 # ── BIAS ──────────────────────────────────────────────────
 def bias(candles):
-    if not candles or len(candles) < 10:
+    
+        if not candles or len(candles) < 26:
+            return "NEUTRAL"
+        closes = [c["c"] for c in candles]
+        def ema(data, period):
+            k = 2 / (period + 1)
+            val = sum(data[-period:]) / period
+            for p in reversed(data[:-period]):
+                val = p * k + val * (1 - k)
+            return val
+        macd = ema(closes, 12) - ema(closes, 26)
+        if macd > 0:
+            return "BULLISH"
+        elif macd < 0:
+            return "BEARISH"
         return "NEUTRAL"
-    highs = [c["h"] for c in candles[:10]]
-    lows  = [c["l"] for c in candles[:10]]
-    avg_h_recent = sum(highs[:5]) / 5
-    avg_h_older  = sum(highs[5:]) / 5
-    avg_l_recent = sum(lows[:5])  / 5
-    avg_l_older  = sum(lows[5:])  / 5
-    if avg_h_recent < avg_h_older and avg_l_recent < avg_l_older:
-        return "BEARISH"
-    if avg_h_recent > avg_h_older and avg_l_recent > avg_l_older:
-        return "BULLISH"
-    return "NEUTRAL"
 
-# ── BOS ───────────────────────────────────────────────────
-def bos(candles, direction):
-    if not candles or len(candles) < 7:
-        return False, None, None
-    latest    = candles[0]
-    structure = candles[2:7]
-    if direction == "BEARISH":
-        structure_low = min(c["l"] for c in structure)
-        if latest["c"] < structure_low:
-            return True, latest["l"], structure_low
+# ── 
+de
+    
+
+    
+    
+
+    
+        
+    
     if direction == "BULLISH":
         structure_high = max(c["h"] for c in structure)
         if latest["c"] > structure_high:
@@ -165,7 +168,15 @@ def scan():
     h4b = bias(h4)
     print(f"H4: {h4b}")
     if h4b == "NEUTRAL": h4b = bias(m15)
+if h4b != bias(h1): return
 
+        
+    
+        
+        
+        
+        
+        
     h1_bos, h1_wick, _ = bos(h1, h4b)
     print(f"H1 BOS: {h1_bos}")
     if not h1_bos: return
