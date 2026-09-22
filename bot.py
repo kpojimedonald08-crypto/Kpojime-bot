@@ -168,7 +168,7 @@ def scan():
     h4b = bias(h4)
     print(f"H4: {h4b}")
     if h4b == "NEUTRAL": h4b = bias(m15)
-if h4b != bias(h1): return
+    if h4b != bias(h1): return
 
         
     
