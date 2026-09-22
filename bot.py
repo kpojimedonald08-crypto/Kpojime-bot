@@ -87,21 +87,20 @@ def bias(candles):
         return "NEUTRAL"
 
 # ── 
-de
-    
-
-    
-    
-
-    
-        
-    
+def bos(candles, direction):
+    if not candles or len(candles) < 7:
+        return False, None, None
+    latest    = candles[0]
+    structure = candles[2:7]
+    if direction == "BEARISH":
+        structure_low = min(c["l"] for c in structure)
+        if latest["c"] < structure_low:
+            return True, latest["l"], structure_low
     if direction == "BULLISH":
         structure_high = max(c["h"] for c in structure)
         if latest["c"] > structure_high:
             return True, latest["h"], structure_high
     return False, None, None
-
 # ── M5 TRIGGER ────────────────────────────────────────────
 def m5_trigger(candles, direction):
     if not candles or len(candles) < 7:
