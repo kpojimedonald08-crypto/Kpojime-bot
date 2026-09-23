@@ -208,7 +208,7 @@ def scan():
     if not h1_bos: return
 
     current_price = m5[0]["c"]
-    tolerance = 5.0
+    tolerance = 15.0
     if abs(current_price - h1_wick) > tolerance:
         print("Price not at BOS level - waiting"); return
 
