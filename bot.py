@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_KEY     = os.environ.get("TWELVEDATA_KEY")
 SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "300"))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
-PAIR               = "XAU/USD"
+PAIRS              = ["XAU/USD", "EUR/USD", "GBP/USD"]
 HEARTBEAT_INTERVAL = 7200
 PING_INTERVAL      = 600
 
@@ -174,95 +174,96 @@ def sr_warning(candles, direction, entry):
     return ""
 
 # ── SCAN ──────────────────────────────────────────────────
-last_signal_time = 0
-last_heartbeat   = 0
-signal_cooldown  = 3600
+last_signal_time = {}
+last_heartbeat    = 0
+signal_cooldown   = 3600
 
 def scan():
-    global last_signal_time, last_heartbeat
+    global last_heartbeat
     now_ts  = time.time()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
-        send(f"🤖 Kpojime Bot — ACTIVE\nScanning: XAU/USD\nNo setup yet — market not ready.\nTime: {now_str}")
+        send(f"🤖 Kpojime Bot — ACTIVE\nScanning: {', '.join(PAIRS)}\nNo setup yet — market not ready.\nTime: {now_str}")
         last_heartbeat = now_ts
 
-    print(f"Scanning {PAIR} at {now_str}")
-    h4  = fetch(PAIR, "4h",    30)
-    h1  = fetch(PAIR, "1h",    30)
-    m15 = fetch(PAIR, "15min", 30)
-    m5  = fetch(PAIR, "5min",  30)
+    for pair in PAIRS:
+        print(f"Scanning {pair} at {now_str}")
+        h4  = fetch(pair, "4h",    30)
+        h1  = fetch(pair, "1h",    30)
+        m15 = fetch(pair, "15min", 30)
+        m5  = fetch(pair, "5min",  30)
 
-    if not h4 or not h1 or not m15 or not m5:
-        print("Missing data — skip"); return
+        if not h4 or not h1 or not m15 or not m5:
+            print(f"{pair}: Missing data — skip"); continue
 
-    h4b = bias(h4)
-    print(f"H4: {h4b}")
-    if h4b == "NEUTRAL":
-        h4b = bias(m15)
-    if h4b != bias(h1):
-        print("H4/H1 conflict — skip"); return
+        h4b = bias(h4)
+        print(f"{pair} H4: {h4b}")
+        if h4b == "NEUTRAL":
+            h4b = bias(m15)
+        if h4b != bias(h1):
+            print(f"{pair}: H4/H1 conflict — skip"); continue
 
-    h1_bos, h1_wick, _ = bos(h1, h4b)
-    print(f"H1 BOS: {h1_bos}")
-    if not h1_bos: return
+        h1_bos, h1_wick, _ = bos(h1, h4b)
+        print(f"{pair} H1 BOS: {h1_bos}")
+        if not h1_bos: continue
 
-    current_price = m5[0]["c"]
-    tolerance = 15.0
-    if abs(current_price - h1_wick) > tolerance:
-        print("Price not at BOS level - waiting"); return
+        current_price = m5[0]["c"]
+        tolerance = 15.0
+        if abs(current_price - h1_wick) > tolerance:
+            print(f"{pair}: Price not at BOS level - waiting"); continue
 
-    if bias(m15) != h4b:
-        print("M15 not aligned"); return
-    if not macd_aligned(h1, h4b):
-        print("MACD conflict"); return
-    if not m5_trigger(m5, h4b):
-        print("M5 not triggered"); return
-    if now_ts - last_signal_time < signal_cooldown:
-        print("Cooldown"); return
+        if bias(m15) != h4b:
+            print(f"{pair}: M15 not aligned"); continue
+        if not macd_aligned(h1, h4b):
+            print(f"{pair}: MACD conflict"); continue
+        if not m5_trigger(m5, h4b):
+            print(f"{pair}: M5 not triggered"); continue
+        if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
+            print(f"{pair}: Cooldown"); continue
 
-    entry = m5[0]["c"]
-    sl, tp1, tp2, tp3 = levels(entry, h4b, h1_wick if h1_wick else entry)
-    direction  = "SELL" if h4b == "BEARISH" else "BUY"
-    risk       = abs(entry - sl)
-    rr2        = round(abs(tp2 - entry) / risk, 1) if risk > 0 else 0
-    emoji      = "🔴" if direction == "SELL" else "🟢"
-    liq        = "✅" if liquidity_grab(m15, h4b) else "❌"
-    sr_warn    = sr_warning(h1, h4b, entry)
-    sr_line    = f"S/R Warning  : {sr_warn}\n" if sr_warn else ""
+        entry = m5[0]["c"]
+        sl, tp1, tp2, tp3 = levels(entry, h4b, h1_wick if h1_wick else entry)
+        direction  = "SELL" if h4b == "BEARISH" else "BUY"
+        risk       = abs(entry - sl)
+        rr2        = round(abs(tp2 - entry) / risk, 1) if risk > 0 else 0
+        emoji      = "🔴" if direction == "SELL" else "🟢"
+        liq        = "✅" if liquidity_grab(m15, h4b) else "❌"
+        sr_warn    = sr_warning(h1, h4b, entry)
+        sr_line    = f"S/R Warning  : {sr_warn}\n" if sr_warn else ""
 
-    msg = (
-        f"{emoji} SIGNAL ALERT — XAU/USD\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"Direction : {direction}\n"
-        f"Entry     : {entry:.2f}\n"
-        f"Stop Loss : {sl:.2f}\n"
-        f"TP1 (1:1) : {tp1:.2f}\n"
-        f"TP2 (1:2) : {tp2:.2f}\n"
-        f"TP3 (1:3) : {tp3:.2f}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"H4 Bias      : {h4b}\n"
-        f"H1 BOS       : ✅\n"
-        f"M15 Confirm  : ✅\n"
-        f"M5 Trigger   : ✅\n"
-        f"MACD         : ✅\n"
-        f"Liq. Grab    : {liq}\n"
-        f"{sr_line}"
-        f"R:R (TP2)    : 1:{rr2}\n"
-        f"Time         : {now_str}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Confirm on chart. Use 2% risk."
-    )
-    send(msg)
-    last_signal_time = now_ts
-    print(f"Signal sent: {direction} @ {entry:.2f}")
+        msg = (
+            f"{emoji} SIGNAL ALERT — {pair}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"Direction : {direction}\n"
+            f"Entry     : {entry:.4f}\n"
+            f"Stop Loss : {sl:.4f}\n"
+            f"TP1 (1:1) : {tp1:.4f}\n"
+            f"TP2 (1:2) : {tp2:.4f}\n"
+            f"TP3 (1:3) : {tp3:.4f}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"H4 Bias      : {h4b}\n"
+            f"H1 BOS       : ✅\n"
+            f"M15 Confirm  : ✅\n"
+            f"M5 Trigger   : ✅\n"
+            f"MACD         : ✅\n"
+            f"Liq. Grab    : {liq}\n"
+            f"{sr_line}"
+            f"R:R (TP2)    : 1:{rr2}\n"
+            f"Time         : {now_str}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"⚠️ Confirm on chart. Use 2% risk."
+        )
+        send(msg)
+        last_signal_time[pair] = now_ts
+        print(f"{pair}: Signal sent: {direction} @ {entry:.4f}")
 
 # ── MAIN ──────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Kpojime Bot starting...")
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=self_ping,  daemon=True).start()
-    send(f"🚀 Kpojime Bot STARTED\nScanning XAU/USD every {SCAN_INTERVAL//60} min.\nHeartbeat every 2 hours.")
+    send(f"🚀 Kpojime Bot STARTED\nScanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\nHeartbeat every 2 hours.")
     while True:
         try:
             scan()
