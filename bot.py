@@ -85,12 +85,23 @@ def bias(candles):
         return "BEARISH"
     return "NEUTRAL"
 
+# ── CANDLE STRENGTH ───────────────────────────────────────
+def is_strong_candle(candle, min_body_ratio=0.6):
+    total_range = candle["h"] - candle["l"]
+    if total_range == 0:
+        return False
+    body = abs(candle["c"] - candle["o"])
+    return (body / total_range) >= min_body_ratio
+
 # ── BOS ───────────────────────────────────────────────────
 def bos(candles, direction):
     if not candles or len(candles) < 7:
         return False, None, None
     latest    = candles[0]
     structure = candles[2:7]
+    if not is_strong_candle(latest):
+        print(f"BOS rejected — weak candle (body ratio too low)")
+        return False, None, None
     if direction == "BEARISH":
         structure_low = min(c["l"] for c in structure)
         if latest["c"] < structure_low:
