@@ -149,7 +149,7 @@ def macd_aligned(candles, direction):
 
 # ── LEVELS ────────────────────────────────────────────────
 def levels(entry, direction, bos_wick):
-    buffer = entry * 0.0024
+    buffer = 10.0
     if direction == "BEARISH":
         sl   = bos_wick + buffer
         risk = sl - entry
@@ -167,11 +167,10 @@ def sr_warning(candles, direction, entry):
     lows  = [c["l"] for c in candles[:20]]
     resistance = max(highs)
     support    = min(lows)
-    threshold  = entry * 0.005
-    if direction == "BULLISH" and (resistance - entry) < threshold:
-        return f"⚠️ Near resistance at {resistance:.4f}"
-    if direction == "BEARISH" and (entry - support) < threshold:
-        return f"⚠️ Near support at {support:.4f}"
+    if direction == "BULLISH" and (resistance - entry) < 20:
+        return f"⚠️ Near resistance at {resistance:.2f}"
+    if direction == "BEARISH" and (entry - support) < 20:
+        return f"⚠️ Near support at {support:.2f}"
     return ""
 
 # ── SCAN ──────────────────────────────────────────────────
@@ -210,7 +209,7 @@ def scan():
         if not h1_bos: continue
 
         current_price = m5[0]["c"]
-        tolerance = current_price * 0.004
+        tolerance = 15.0
         if abs(current_price - h1_wick) > tolerance:
             print(f"{pair}: Price not at BOS level - waiting"); continue
 
