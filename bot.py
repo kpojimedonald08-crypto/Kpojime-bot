@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_KEY     = os.environ.get("TWELVEDATA_KEY")
 SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "300"))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
-PAIRS              = ["XAU/USD", "EUR/USD", "GBP/USD"]
+PAIRS              = ["XAU/USD", "WTI/USD"]
 HEARTBEAT_INTERVAL = 7200
 PING_INTERVAL      = 600
 
@@ -149,7 +149,7 @@ def macd_aligned(candles, direction):
 
 # ── LEVELS ────────────────────────────────────────────────
 def levels(entry, direction, bos_wick):
-    buffer = 10.0
+    buffer = entry * 0.0024
     if direction == "BEARISH":
         sl   = bos_wick + buffer
         risk = sl - entry
@@ -167,10 +167,11 @@ def sr_warning(candles, direction, entry):
     lows  = [c["l"] for c in candles[:20]]
     resistance = max(highs)
     support    = min(lows)
-    if direction == "BULLISH" and (resistance - entry) < 20:
-        return f"⚠️ Near resistance at {resistance:.2f}"
-    if direction == "BEARISH" and (entry - support) < 20:
-        return f"⚠️ Near support at {support:.2f}"
+    threshold  = entry * 0.005
+    if direction == "BULLISH" and (resistance - entry) < threshold:
+        return f"⚠️ Near resistance at {resistance:.4f}"
+    if direction == "BEARISH" and (entry - support) < threshold:
+        return f"⚠️ Near support at {support:.4f}"
     return ""
 
 # ── SCAN ──────────────────────────────────────────────────
@@ -209,7 +210,7 @@ def scan():
         if not h1_bos: continue
 
         current_price = m5[0]["c"]
-        tolerance = 15.0
+        tolerance = current_price * 0.004
         if abs(current_price - h1_wick) > tolerance:
             print(f"{pair}: Price not at BOS level - waiting"); continue
 
