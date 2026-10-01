@@ -85,6 +85,19 @@ def bias(candles):
         return "BEARISH"
     return "NEUTRAL"
 
+# ── MACD VALUE ────────────────────────────────────────────
+def macd_value(candles):
+    if not candles or len(candles) < 26:
+        return 0
+    closes = [c["c"] for c in candles]
+    def ema(data, period):
+        k = 2 / (period + 1)
+        val = sum(data[-period:]) / period
+        for p in reversed(data[:-period]):
+            val = p * k + val * (1 - k)
+        return val
+    return ema(closes, 12) - ema(closes, 26)
+
 # ── BOS ───────────────────────────────────────────────────
 def bos(candles, direction):
     if not candles or len(candles) < 7:
@@ -129,7 +142,7 @@ def m5_trigger(candles, direction):
         return latest["c"] > max(c["h"] for c in structure)
     return False
 
-# ── MACD ──────────────────────────────────────────────────
+# ── MACD ALIGNED ─────────────────────────────────────────
 def macd_aligned(candles, direction):
     if not candles or len(candles) < 26:
         return True
@@ -203,6 +216,13 @@ def scan():
             h4b = bias(m15)
         if h4b != bias(h1):
             print(f"{pair}: H4/H1 conflict — skip"); continue
+
+        # H1 MACD momentum filter
+        h1_macd = macd_value(h1)
+        if h4b == "BEARISH" and h1_macd > -5:
+            print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); continue
+        if h4b == "BULLISH" and h1_macd < 5:
+            print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); continue
 
         h1_bos, h1_wick, _ = bos(h1, h4b)
         print(f"{pair} H1 BOS: {h1_bos}")
