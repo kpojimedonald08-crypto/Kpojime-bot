@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_KEY     = os.environ.get("TWELVEDATA_KEY")
-SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "600"))
+SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "300"))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
 PAIRS              = ["XAU/USD"]
 HEARTBEAT_INTERVAL = 7200
