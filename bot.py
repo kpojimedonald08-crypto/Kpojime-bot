@@ -67,17 +67,19 @@ def fetch(symbol, interval, count=30):
         print(f"Fetch exception {symbol} {interval}: {e}")
         return None
 
+# ── EMA ───────────────────────────────────────────────────
+def ema(data, period):
+    k = 2 / (period + 1)
+    val = sum(data[-period:]) / period
+    for p in reversed(data[:-period]):
+        val = p * k + val * (1 - k)
+    return val
+
 # ── BIAS ──────────────────────────────────────────────────
 def bias(candles):
     if not candles or len(candles) < 26:
         return "NEUTRAL"
     closes = [c["c"] for c in candles]
-    def ema(data, period):
-        k = 2 / (period + 1)
-        val = sum(data[-period:]) / period
-        for p in reversed(data[:-period]):
-            val = p * k + val * (1 - k)
-        return val
     macd = ema(closes, 12) - ema(closes, 26)
     if macd > 0:
         return "BULLISH"
@@ -90,35 +92,23 @@ def macd_value(candles):
     if not candles or len(candles) < 26:
         return 0
     closes = [c["c"] for c in candles]
-    def ema(data, period):
-        k = 2 / (period + 1)
-        val = sum(data[-period:]) / period
-        for p in reversed(data[:-period]):
-            val = p * k + val * (1 - k)
-        return val
     return ema(closes, 12) - ema(closes, 26)
 
 # ── MARKET CONDITION ──────────────────────────────────────
 def market_condition(h4_candles, h1_candles):
     if not h4_candles or not h1_candles:
         return "UNKNOWN", 0, 0, 0
-
     h4_macd = macd_value(h4_candles)
     h1_macd = macd_value(h1_candles)
-
-    # Range from recent 20 H1 candles
     recent = h1_candles[:20]
     range_high = max(c["h"] for c in recent)
     range_low  = min(c["l"] for c in recent)
-
-    # Strong trend: H4 MACD beyond ±15 and H1 beyond ±5
     if h4_macd < -15 and h1_macd < -5:
         condition = "TRENDING BEARISH"
     elif h4_macd > 15 and h1_macd > 5:
         condition = "TRENDING BULLISH"
     else:
         condition = "CHOPPY"
-
     return condition, h4_macd, range_high, range_low
 
 # ── BOS ───────────────────────────────────────────────────
@@ -170,12 +160,6 @@ def macd_aligned(candles, direction):
     if not candles or len(candles) < 26:
         return True
     closes = [c["c"] for c in candles]
-    def ema(data, period):
-        k = 2 / (period + 1)
-        val = sum(data[-period:]) / period
-        for p in reversed(data[:-period]):
-            val = p * k + val * (1 - k)
-        return val
     macd = ema(closes, 12) - ema(closes, 26)
     if direction == "BEARISH":
         return macd < 0
@@ -220,15 +204,18 @@ def scan():
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     for pair in PAIRS:
+        print(f"Scanning {pair} at {now_str}")
         h4  = fetch(pair, "4h",    30)
         h1  = fetch(pair, "1h",    30)
         m15 = fetch(pair, "15min", 30)
         m5  = fetch(pair, "5min",  30)
 
-        # ── HEARTBEAT ─────────────────────────────────────
+        if not h4 or not h1 or not m15 or not m5:
+            print(f"{pair}: Missing data — skip"); continue
+
+        # ── HEARTBEAT — uses fresh candle data ────────────
         if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
             condition, h4_macd, r_high, r_low = market_condition(h4, h1)
-
             if condition == "CHOPPY":
                 hb_msg = (
                     f"🤖 Kpojime Bot — ACTIVE\n"
@@ -266,9 +253,6 @@ def scan():
                 )
             send(hb_msg)
             last_heartbeat = now_ts
-
-        if not h4 or not h1 or not m15 or not m5:
-            print(f"{pair}: Missing data — skip"); continue
 
         h4b = bias(h4)
         print(f"{pair} H4: {h4b}")
