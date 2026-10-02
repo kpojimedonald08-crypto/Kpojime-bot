@@ -98,6 +98,29 @@ def macd_value(candles):
         return val
     return ema(closes, 12) - ema(closes, 26)
 
+# ── MARKET CONDITION ──────────────────────────────────────
+def market_condition(h4_candles, h1_candles):
+    if not h4_candles or not h1_candles:
+        return "UNKNOWN", 0, 0, 0
+
+    h4_macd = macd_value(h4_candles)
+    h1_macd = macd_value(h1_candles)
+
+    # Range from recent 20 H1 candles
+    recent = h1_candles[:20]
+    range_high = max(c["h"] for c in recent)
+    range_low  = min(c["l"] for c in recent)
+
+    # Strong trend: H4 MACD beyond ±15 and H1 beyond ±5
+    if h4_macd < -15 and h1_macd < -5:
+        condition = "TRENDING BEARISH"
+    elif h4_macd > 15 and h1_macd > 5:
+        condition = "TRENDING BULLISH"
+    else:
+        condition = "CHOPPY"
+
+    return condition, h4_macd, range_high, range_low
+
 # ── BOS ───────────────────────────────────────────────────
 def bos(candles, direction):
     if not candles or len(candles) < 7:
@@ -196,16 +219,53 @@ def scan():
     now_ts  = time.time()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
-        send(f"🤖 Kpojime Bot — ACTIVE\nScanning: {', '.join(PAIRS)}\nNo setup yet — market not ready.\nTime: {now_str}")
-        last_heartbeat = now_ts
-
     for pair in PAIRS:
-        print(f"Scanning {pair} at {now_str}")
         h4  = fetch(pair, "4h",    30)
         h1  = fetch(pair, "1h",    30)
         m15 = fetch(pair, "15min", 30)
         m5  = fetch(pair, "5min",  30)
+
+        # ── HEARTBEAT ─────────────────────────────────────
+        if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
+            condition, h4_macd, r_high, r_low = market_condition(h4, h1)
+
+            if condition == "CHOPPY":
+                hb_msg = (
+                    f"🤖 Kpojime Bot — ACTIVE\n"
+                    f"Scanning: {pair}\n"
+                    f"Time: {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📊 Market: CHOPPY ⛔\n"
+                    f"Range: {r_low:.2f} — {r_high:.2f}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"⛔ NO TRADE until breakout\n"
+                    f"🔼 Above {r_high:.2f} = BUY opportunity\n"
+                    f"🔽 Below {r_low:.2f} = SELL opportunity"
+                )
+            elif condition == "TRENDING BEARISH":
+                hb_msg = (
+                    f"🤖 Kpojime Bot — ACTIVE\n"
+                    f"Scanning: {pair}\n"
+                    f"Time: {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📊 Market: TRENDING BEARISH 🔴\n"
+                    f"H4 Momentum: Strong ({h4_macd:.1f})\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"✅ Good conditions — watch for SELL signals"
+                )
+            else:
+                hb_msg = (
+                    f"🤖 Kpojime Bot — ACTIVE\n"
+                    f"Scanning: {pair}\n"
+                    f"Time: {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📊 Market: TRENDING BULLISH 🟢\n"
+                    f"H4 Momentum: Strong ({h4_macd:.1f})\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"✅ Good conditions — watch for BUY signals"
+                )
+            send(hb_msg)
+            last_heartbeat = now_ts
 
         if not h4 or not h1 or not m15 or not m5:
             print(f"{pair}: Missing data — skip"); continue
