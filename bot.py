@@ -45,6 +45,22 @@ def send(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
+# ── WEEKEND CHECK ─────────────────────────────────────────
+def is_weekend():
+    now = datetime.utcnow()
+    # Saturday = 5, Sunday = 6
+    if now.weekday() == 5:
+        return True
+    if now.weekday() == 6:
+        return True
+    # Friday after 21:00 UTC (market closes)
+    if now.weekday() == 4 and now.hour >= 21:
+        return True
+    # Sunday before 22:00 UTC (market opens)
+    if now.weekday() == 6 and now.hour < 22:
+        return True
+    return False
+
 # ── FETCH CANDLES ─────────────────────────────────────────
 def fetch(symbol, interval, count=30):
     try:
@@ -203,6 +219,11 @@ def scan():
     now_ts  = time.time()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+    # ── WEEKEND CHECK ─────────────────────────────────────
+    if is_weekend():
+        print(f"Weekend — market closed. Sleeping...")
+        return
+
     for pair in PAIRS:
         print(f"Scanning {pair} at {now_str}")
         h4  = fetch(pair, "4h",    30)
@@ -213,7 +234,7 @@ def scan():
         if not h4 or not h1 or not m15 or not m5:
             print(f"{pair}: Missing data — skip"); continue
 
-        # ── HEARTBEAT — uses fresh candle data ────────────
+        # ── HEARTBEAT ─────────────────────────────────────
         if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
             condition, h4_macd, r_high, r_low = market_condition(h4, h1)
             if condition == "CHOPPY":
@@ -261,7 +282,6 @@ def scan():
         if h4b != bias(h1):
             print(f"{pair}: H4/H1 conflict — skip"); continue
 
-        # H1 MACD momentum filter
         h1_macd = macd_value(h1)
         if h4b == "BEARISH" and h1_macd > -5:
             print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); continue
