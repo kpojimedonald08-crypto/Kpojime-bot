@@ -15,6 +15,20 @@ PAIRS              = ["XAU/USD"]
 HEARTBEAT_INTERVAL = 7200
 PING_INTERVAL      = 600
 
+# ── DAILY SLEEP WINDOW (UTC) ──────────────────────────────
+# Bot sleeps from SLEEP_START_UTC until WAKE_UTC (saves Twelve Data credits
+# and avoids the US session). 13:00 UTC = 2pm WAT, 23:00 UTC = midnight WAT.
+SLEEP_START_UTC = int(os.environ.get("SLEEP_START_UTC", "13"))
+WAKE_UTC        = int(os.environ.get("WAKE_UTC", "23"))
+
+# ── CHOP SIGNAL SETTINGS ──────────────────────────────────
+CHOP_ENABLED    = os.environ.get("CHOP_ENABLED", "1") == "1"
+CHOP_LOOKBACK   = 20      # M15 candles used to build the range
+CHOP_SL_BUFFER  = float(os.environ.get("CHOP_SL_BUFFER", "5.0"))
+CHOP_MIN_RANGE  = float(os.environ.get("CHOP_MIN_RANGE", "20.0"))
+CHOP_MAX_RANGE  = float(os.environ.get("CHOP_MAX_RANGE", "120.0"))
+CHOP_MIN_RR     = float(os.environ.get("CHOP_MIN_RR", "1.0"))
+
 # ── KEEP-ALIVE SERVER ─────────────────────────────────────
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,8 +65,6 @@ def is_weekend():
     # Saturday = 5, Sunday = 6
     if now.weekday() == 5:
         return True
-    if now.weekday() == 6:
-        return True
     # Friday after 21:00 UTC (market closes)
     if now.weekday() == 4 and now.hour >= 21:
         return True
@@ -60,6 +72,15 @@ def is_weekend():
     if now.weekday() == 6 and now.hour < 22:
         return True
     return False
+
+# ── DAILY SLEEP CHECK ─────────────────────────────────────
+def in_daily_sleep(now=None):
+    now = now or datetime.utcnow()
+    h = now.hour
+    if SLEEP_START_UTC < WAKE_UTC:
+        return SLEEP_START_UTC <= h < WAKE_UTC
+    # window wraps past midnight
+    return h >= SLEEP_START_UTC or h < WAKE_UTC
 
 # ── FETCH CANDLES ─────────────────────────────────────────
 def fetch(symbol, interval, count=30):
@@ -209,20 +230,93 @@ def sr_warning(candles, direction, entry):
         return f"⚠️ Near support at {support:.2f}"
     return ""
 
+# ── CHOP SIGNAL (M15 range + M5 sweep & rejection) ────────
+def chop_signal(m15, m5):
+    """
+    Range = high/low of the M15 candles before the most recent 3 (45 min).
+    Signal when an M5 candle in the last 3 wicked beyond a range edge and the
+    latest M5 closed back inside the range with a rejection candle.
+    Uses candles already fetched for the BOS scan, so no extra API calls.
+    Returns a dict or None.
+    """
+    if not m15 or len(m15) < CHOP_LOOKBACK + 3 or not m5 or len(m5) < 3:
+        return None
+
+    rng      = m15[3:3 + CHOP_LOOKBACK]
+    r_high   = max(c["h"] for c in rng)
+    r_low    = min(c["l"] for c in rng)
+    width    = r_high - r_low
+    if width < CHOP_MIN_RANGE or width > CHOP_MAX_RANGE:
+        return None
+    mid      = (r_high + r_low) / 2
+
+    latest   = m5[0]
+    recent   = m5[:3]
+    hi_wick  = max(c["h"] for c in recent)
+    lo_wick  = min(c["l"] for c in recent)
+    entry    = latest["c"]
+
+    swept_high = hi_wick > r_high
+    swept_low  = lo_wick < r_low
+    if swept_high and swept_low:
+        return None  # ambiguous, skip
+
+    if swept_high and mid < entry < r_high and latest["c"] < latest["o"]:
+        sl   = hi_wick + CHOP_SL_BUFFER
+        risk = sl - entry
+        if risk <= 0:
+            return None
+        tp1, tp2 = mid, r_low
+        rr2 = (entry - tp2) / risk
+        if rr2 < CHOP_MIN_RR:
+            return None
+        return {"direction": "SELL", "entry": entry, "sl": sl, "tp1": tp1,
+                "tp2": tp2, "rr2": round(rr2, 1), "r_high": r_high,
+                "r_low": r_low, "swept": "range high"}
+
+    if swept_low and r_low < entry < mid and latest["c"] > latest["o"]:
+        sl   = lo_wick - CHOP_SL_BUFFER
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        tp1, tp2 = mid, r_high
+        rr2 = (tp2 - entry) / risk
+        if rr2 < CHOP_MIN_RR:
+            return None
+        return {"direction": "BUY", "entry": entry, "sl": sl, "tp1": tp1,
+                "tp2": tp2, "rr2": round(rr2, 1), "r_high": r_high,
+                "r_low": r_low, "swept": "range low"}
+
+    return None
+
 # ── SCAN ──────────────────────────────────────────────────
 last_signal_time = {}
 last_heartbeat    = 0
 signal_cooldown   = 3600
+sleep_notified    = False
 
 def scan():
-    global last_heartbeat
+    global last_heartbeat, sleep_notified
     now_ts  = time.time()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     # ── WEEKEND CHECK ─────────────────────────────────────
     if is_weekend():
-        print(f"Weekend — market closed. Sleeping...")
+        print("Weekend — market closed. Sleeping...")
         return
+
+    # ── DAILY SLEEP CHECK (no API calls while asleep) ─────
+    if in_daily_sleep():
+        if not sleep_notified:
+            send(f"😴 Kpojime Bot — SLEEPING\n"
+                 f"No scans until {WAKE_UTC:02d}:00 UTC.\n"
+                 f"Time: {now_str}")
+            sleep_notified = True
+        print(f"Daily sleep window ({SLEEP_START_UTC:02d}:00-{WAKE_UTC:02d}:00 UTC) — skipping scan")
+        return
+    if sleep_notified:
+        send(f"☀️ Kpojime Bot — AWAKE\nScanning resumed.\nTime: {now_str}")
+        sleep_notified = False
 
     for pair in PAIRS:
         print(f"Scanning {pair} at {now_str}")
@@ -234,9 +328,10 @@ def scan():
         if not h4 or not h1 or not m15 or not m5:
             print(f"{pair}: Missing data — skip"); continue
 
+        condition, h4_macd, r_high, r_low = market_condition(h4, h1)
+
         # ── HEARTBEAT ─────────────────────────────────────
         if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
-            condition, h4_macd, r_high, r_low = market_condition(h4, h1)
             if condition == "CHOPPY":
                 hb_msg = (
                     f"🤖 Kpojime Bot — ACTIVE\n"
@@ -246,9 +341,10 @@ def scan():
                     f"📊 Market: CHOPPY ⛔\n"
                     f"Range: {r_low:.2f} — {r_high:.2f}\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"⛔ NO TRADE until breakout\n"
+                    f"⛔ NO TREND TRADE until breakout\n"
                     f"🔼 Above {r_high:.2f} = BUY opportunity\n"
-                    f"🔽 Below {r_low:.2f} = SELL opportunity"
+                    f"🔽 Below {r_low:.2f} = SELL opportunity\n"
+                    f"↔️ CHOP sweep signals active (M15 range / M5 rejection)"
                 )
             elif condition == "TRENDING BEARISH":
                 hb_msg = (
@@ -274,6 +370,33 @@ def scan():
                 )
             send(hb_msg)
             last_heartbeat = now_ts
+
+        # ── CHOP SIGNAL (only when market is choppy) ──────
+        if CHOP_ENABLED and condition == "CHOPPY":
+            chop = chop_signal(m15, m5)
+            chop_key = f"{pair}_chop"
+            if chop and now_ts - last_signal_time.get(chop_key, 0) >= signal_cooldown:
+                emoji = "🔴" if chop["direction"] == "SELL" else "🟢"
+                msg = (
+                    f"{emoji} CHOP SIGNAL — {pair}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"Direction : {chop['direction']}\n"
+                    f"Entry     : {chop['entry']:.4f}\n"
+                    f"Stop Loss : {chop['sl']:.4f}\n"
+                    f"TP1 (mid) : {chop['tp1']:.4f}\n"
+                    f"TP2 (edge): {chop['tp2']:.4f}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"Setup        : M5 sweep of {chop['swept']} + rejection\n"
+                    f"M15 Range    : {chop['r_low']:.2f} — {chop['r_high']:.2f}\n"
+                    f"R:R (TP2)    : 1:{chop['rr2']}\n"
+                    f"Time         : {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ Range trade, not a trend trade. Take profit early, size smaller."
+                )
+                send(msg)
+                last_signal_time[chop_key] = now_ts
+                print(f"{pair}: CHOP signal sent: {chop['direction']} @ {chop['entry']:.4f}")
+                continue
 
         h4b = bias(h4)
         print(f"{pair} H4: {h4b}")
@@ -347,7 +470,10 @@ if __name__ == "__main__":
     print("Kpojime Bot starting...")
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=self_ping,  daemon=True).start()
-    send(f"🚀 Kpojime Bot STARTED\nScanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\nHeartbeat every 2 hours.")
+    send(f"🚀 Kpojime Bot STARTED\n"
+         f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
+         f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
+         f"Heartbeat every 2 hours.")
     while True:
         try:
             scan()
