@@ -29,6 +29,13 @@ CHOP_MIN_RANGE  = float(os.environ.get("CHOP_MIN_RANGE", "20.0"))
 CHOP_MAX_RANGE  = float(os.environ.get("CHOP_MAX_RANGE", "120.0"))
 CHOP_MIN_RR     = float(os.environ.get("CHOP_MIN_RR", "1.0"))
 
+# ── TRADE TRACKER SETTINGS ────────────────────────────────
+# While a signal is open the bot polls M1 candles (1 credit per poll, per pair)
+# and alerts on TP1 / TP2 / TP3 / SL. Polling stops when the trade closes.
+TRACK_INTERVAL  = int(os.environ.get("TRACK_INTERVAL", "120"))    # seconds between polls
+TRACK_MAX_HOURS = float(os.environ.get("TRACK_MAX_HOURS", "4"))   # stop tracking after this
+BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry as stop after TP1
+
 # ── KEEP-ALIVE SERVER ─────────────────────────────────────
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -96,7 +103,8 @@ def fetch(symbol, interval, count=30):
             print(f"Fetch error {symbol} {interval}: {d.get('message','no data')}")
             return None
         return [
-            {"o": float(v["open"]), "h": float(v["high"]),
+            {"t": v.get("datetime", ""),
+             "o": float(v["open"]), "h": float(v["high"]),
              "l": float(v["low"]),  "c": float(v["close"])}
             for v in d["values"]
         ]
@@ -289,6 +297,93 @@ def chop_signal(m15, m5):
 
     return None
 
+# ── TRADE TRACKER ─────────────────────────────────────────
+active_trades = []
+
+def add_trade(pair, kind, direction, entry, sl, tps):
+    """tps = [("TP1", price), ("TP2", price), ...] in order."""
+    active_trades.append({
+        "pair": pair, "kind": kind, "direction": direction,
+        "entry": entry, "sl": sl, "risk": abs(entry - sl),
+        "tps": tps, "hit": 0, "base_t": None, "created": time.time(),
+    })
+    print(f"{pair}: tracking {kind} {direction} @ {entry:.4f}")
+
+def _r_mult(trade, price):
+    return abs(price - trade["entry"]) / trade["risk"] if trade["risk"] > 0 else 0
+
+def _reached(trade, c, price):
+    return c["h"] >= price if trade["direction"] == "BUY" else c["l"] <= price
+
+def _stopped(trade, c, level):
+    return c["l"] <= level if trade["direction"] == "BUY" else c["h"] >= level
+
+def process_candle(t, c):
+    """Returns True when the trade is finished."""
+    head = f"{t['pair']} {t['direction']} ({t['kind']})"
+    be   = BE_AFTER_TP1 and t["hit"] >= 1
+    stop = t["entry"] if be else t["sl"]
+
+    # Stop is checked first, so a candle touching both stop and target counts
+    # as a loss (conservative).
+    if _stopped(t, c, stop):
+        if be:
+            send(f"🟡 BREAKEVEN — {head}\n"
+                 f"Price back at entry {t['entry']:.4f} after TP1.\n"
+                 f"If you moved SL to entry, you're out at ~0R.")
+        else:
+            send(f"❌ STOP LOSS HIT — {head}\n"
+                 f"SL {t['sl']:.4f} touched (-1R). Trade closed.")
+        return True
+
+    while t["hit"] < len(t["tps"]):
+        name, price = t["tps"][t["hit"]]
+        if not _reached(t, c, price):
+            break
+        t["hit"] += 1
+        final = t["hit"] == len(t["tps"])
+        if final:
+            tail = "🏁 Final target reached. Trade complete."
+        elif t["hit"] == 1 and BE_AFTER_TP1:
+            tail = f"👉 Move SL to entry ({t['entry']:.4f}) to protect the trade."
+        else:
+            tail = "👉 Consider closing part or trailing your stop."
+        send(f"✅ {name} HIT — {head}\n"
+             f"Price reached {price:.4f} (+{_r_mult(t, price):.1f}R)\n{tail}")
+        if final:
+            return True
+    return False
+
+def track_trades():
+    if not active_trades:
+        return
+    now_ts = time.time()
+
+    for t in active_trades[:]:
+        if now_ts - t["created"] > TRACK_MAX_HOURS * 3600:
+            send(f"⏱ Tracking stopped — {t['pair']} {t['direction']} ({t['kind']})\n"
+                 f"Open for over {TRACK_MAX_HOURS:g}h with no final result. Manage it manually.")
+            active_trades.remove(t)
+
+    for pair in {t["pair"] for t in active_trades}:
+        candles = fetch(pair, "1min", 15)
+        if not candles:
+            continue
+        newest_t = candles[0]["t"]
+        for t in [x for x in active_trades if x["pair"] == pair]:
+            if t["base_t"] is None:
+                t["base_t"] = newest_t      # baseline taken right after the signal
+                continue
+            done = False
+            for c in reversed(candles):     # oldest -> newest
+                if c["t"] >= t["base_t"] and process_candle(t, c):
+                    done = True
+                    break
+            if done:
+                active_trades.remove(t)
+            else:
+                t["base_t"] = newest_t
+
 # ── SCAN ──────────────────────────────────────────────────
 last_signal_time = {}
 last_heartbeat    = 0
@@ -395,6 +490,8 @@ def scan():
                 )
                 send(msg)
                 last_signal_time[chop_key] = now_ts
+                add_trade(pair, "CHOP", chop["direction"], chop["entry"], chop["sl"],
+                          [("TP1", chop["tp1"]), ("TP2", chop["tp2"])])
                 print(f"{pair}: CHOP signal sent: {chop['direction']} @ {chop['entry']:.4f}")
                 continue
 
@@ -463,6 +560,8 @@ def scan():
         )
         send(msg)
         last_signal_time[pair] = now_ts
+        add_trade(pair, "TREND", direction, entry, sl,
+                  [("TP1", tp1), ("TP2", tp2), ("TP3", tp3)])
         print(f"{pair}: Signal sent: {direction} @ {entry:.4f}")
 
 # ── MAIN ──────────────────────────────────────────────────
@@ -474,10 +573,24 @@ if __name__ == "__main__":
          f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
          f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
          f"Heartbeat every 2 hours.")
+    next_scan = 0
     while True:
-        try:
-            scan()
-        except Exception as e:
-            print(f"Error: {e}")
-        print(f"Sleeping {SCAN_INTERVAL//60} min...")
-        time.sleep(SCAN_INTERVAL)
+        if time.time() >= next_scan:
+            try:
+                scan()
+            except Exception as e:
+                print(f"Error: {e}")
+            next_scan = time.time() + SCAN_INTERVAL
+
+        if is_weekend():
+            active_trades.clear()
+
+        if active_trades:
+            try:
+                track_trades()
+            except Exception as e:
+                print(f"Tracker error: {e}")
+            wait = min(TRACK_INTERVAL, max(1, next_scan - time.time()))
+        else:
+            wait = max(1, next_scan - time.time())
+        time.sleep(wait)
