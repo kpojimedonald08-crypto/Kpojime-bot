@@ -28,6 +28,14 @@ CHOP_SL_BUFFER  = float(os.environ.get("CHOP_SL_BUFFER", "5.0"))
 CHOP_MIN_RANGE  = float(os.environ.get("CHOP_MIN_RANGE", "20.0"))
 CHOP_MAX_RANGE  = float(os.environ.get("CHOP_MAX_RANGE", "120.0"))
 CHOP_MIN_RR     = float(os.environ.get("CHOP_MIN_RR", "1.0"))
+# Filters that stop the bot fading a trend/breakout (fix for 3 straight stop-outs)
+CHOP_MAX_H1_MACD = float(os.environ.get("CHOP_MAX_H1_MACD", "2.0"))  # |H1 MACD| above this = trending, no chop trade
+CHOP_MAX_DRIFT   = float(os.environ.get("CHOP_MAX_DRIFT", "0.25"))   # range midpoint drift, as share of range width
+CHOP_MAX_SWEEP   = float(os.environ.get("CHOP_MAX_SWEEP", "0.25"))   # sweep deeper than this share of width = breakout
+CHOP_MIN_TOUCHES = int(os.environ.get("CHOP_MIN_TOUCHES", "2"))      # candles that must have tested each edge
+CHOP_EDGE_ZONE   = 0.2                                               # edge zone = 20% of range width
+CHOP_MAX_LOSSES  = int(os.environ.get("CHOP_MAX_LOSSES", "2"))       # consecutive chop SLs before pausing
+CHOP_PAUSE_HOURS = float(os.environ.get("CHOP_PAUSE_HOURS", "3"))
 
 # ── TRADE TRACKER SETTINGS ────────────────────────────────
 # While a signal is open the bot polls M1 candles (1 credit per poll, per pair)
@@ -239,16 +247,25 @@ def sr_warning(candles, direction, entry):
     return ""
 
 # ── CHOP SIGNAL (M15 range + M5 sweep & rejection) ────────
-def chop_signal(m15, m5):
+def chop_signal(m15, m5, h1_macd=0.0):
     """
     Range = high/low of the M15 candles before the most recent 3 (45 min).
     Signal when an M5 candle in the last 3 wicked beyond a range edge and the
     latest M5 closed back inside the range with a rejection candle.
+
+    A real range must also pass these filters, otherwise a trend that keeps
+    making new highs/lows looks like endless "sweeps" and the bot fades it:
+      1. H1 momentum is weak (|H1 MACD| <= CHOP_MAX_H1_MACD)
+      2. Range midpoint is not drifting (older vs newer half of the lookback)
+      3. Both edges were tested at least CHOP_MIN_TOUCHES times
+      4. The sweep is shallow, and no recent M15 candle closed outside the range
     Uses candles already fetched for the BOS scan, so no extra API calls.
     Returns a dict or None.
     """
     if not m15 or len(m15) < CHOP_LOOKBACK + 3 or not m5 or len(m5) < 3:
         return None
+    if abs(h1_macd) > CHOP_MAX_H1_MACD:
+        return None   # momentum too strong, not a range
 
     rng      = m15[3:3 + CHOP_LOOKBACK]
     r_high   = max(c["h"] for c in rng)
@@ -257,6 +274,21 @@ def chop_signal(m15, m5):
     if width < CHOP_MIN_RANGE or width > CHOP_MAX_RANGE:
         return None
     mid      = (r_high + r_low) / 2
+
+    # drift: newer half vs older half of the range window
+    half = CHOP_LOOKBACK // 2
+    new_part, old_part = rng[:half], rng[half:]
+    new_mid = (max(c["h"] for c in new_part) + min(c["l"] for c in new_part)) / 2
+    old_mid = (max(c["h"] for c in old_part) + min(c["l"] for c in old_part)) / 2
+    if abs(new_mid - old_mid) > CHOP_MAX_DRIFT * width:
+        return None
+
+    # both edges must have been respected more than once
+    zone = CHOP_EDGE_ZONE * width
+    top_touches = sum(1 for c in rng if c["h"] >= r_high - zone)
+    bot_touches = sum(1 for c in rng if c["l"] <= r_low + zone)
+    if top_touches < CHOP_MIN_TOUCHES or bot_touches < CHOP_MIN_TOUCHES:
+        return None
 
     latest   = m5[0]
     recent   = m5[:3]
@@ -268,6 +300,19 @@ def chop_signal(m15, m5):
     swept_low  = lo_wick < r_low
     if swept_high and swept_low:
         return None  # ambiguous, skip
+
+    # a close outside the range on M15 = breakout, not a sweep
+    recent_m15 = m15[:3]
+    if swept_high:
+        if hi_wick - r_high > CHOP_MAX_SWEEP * width:
+            return None
+        if any(c["c"] > r_high for c in recent_m15):
+            return None
+    if swept_low:
+        if r_low - lo_wick > CHOP_MAX_SWEEP * width:
+            return None
+        if any(c["c"] < r_low for c in recent_m15):
+            return None
 
     if swept_high and mid < entry < r_high and latest["c"] < latest["o"]:
         sl   = hi_wick + CHOP_SL_BUFFER
@@ -299,6 +344,7 @@ def chop_signal(m15, m5):
 
 # ── TRADE TRACKER ─────────────────────────────────────────
 active_trades = []
+chop_state = {"losses": 0, "paused_until": 0}
 
 def add_trade(pair, kind, direction, entry, sl, tps):
     """tps = [("TP1", price), ("TP2", price), ...] in order."""
@@ -334,6 +380,14 @@ def process_candle(t, c):
         else:
             send(f"❌ STOP LOSS HIT — {head}\n"
                  f"SL {t['sl']:.4f} touched (-1R). Trade closed.")
+            if t["kind"] == "CHOP":
+                chop_state["losses"] += 1
+                if chop_state["losses"] >= CHOP_MAX_LOSSES:
+                    chop_state["paused_until"] = time.time() + CHOP_PAUSE_HOURS * 3600
+                    chop_state["losses"] = 0
+                    send(f"⏸ CHOP signals paused for {CHOP_PAUSE_HOURS:g}h "
+                         f"after {CHOP_MAX_LOSSES} stop-outs in a row.\n"
+                         f"Market is likely trending, not ranging.")
         return True
 
     while t["hit"] < len(t["tps"]):
@@ -341,6 +395,8 @@ def process_candle(t, c):
         if not _reached(t, c, price):
             break
         t["hit"] += 1
+        if t["kind"] == "CHOP":
+            chop_state["losses"] = 0      # a win resets the loss streak
         final = t["hit"] == len(t["tps"])
         if final:
             tail = "🏁 Final target reached. Trade complete."
@@ -467,8 +523,8 @@ def scan():
             last_heartbeat = now_ts
 
         # ── CHOP SIGNAL (only when market is choppy) ──────
-        if CHOP_ENABLED and condition == "CHOPPY":
-            chop = chop_signal(m15, m5)
+        if CHOP_ENABLED and condition == "CHOPPY" and now_ts >= chop_state["paused_until"]:
+            chop = chop_signal(m15, m5, macd_value(h1))
             chop_key = f"{pair}_chop"
             if chop and now_ts - last_signal_time.get(chop_key, 0) >= signal_cooldown:
                 emoji = "🔴" if chop["direction"] == "SELL" else "🟢"
