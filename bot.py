@@ -37,11 +37,20 @@ CHOP_EDGE_ZONE   = 0.2                                               # edge zone
 CHOP_MAX_LOSSES  = int(os.environ.get("CHOP_MAX_LOSSES", "2"))       # consecutive chop SLs before pausing
 CHOP_PAUSE_HOURS = float(os.environ.get("CHOP_PAUSE_HOURS", "3"))
 
+# ── REAL SUPPORT / RESISTANCE SETTINGS ────────────────────
+SR_WARN_DIST = float(os.environ.get("SR_WARN_DIST", "20"))   # warn if a level is closer than this (points)
+SR_CLUSTER   = float(os.environ.get("SR_CLUSTER", "5"))      # swing points within this many points = one level
+SR_ROUND_STEP = float(os.environ.get("SR_ROUND_STEP", "50"))  # round-number levels every N points
+SR_ROUND_WARN = float(os.environ.get("SR_ROUND_WARN", "10"))  # warn on a round number only if this close
+SR_STRENGTH  = 2                                             # candles each side that must be lower/higher
+
 # ── TRADE TRACKER SETTINGS ────────────────────────────────
 # While a signal is open the bot polls M1 candles (1 credit per poll, per pair)
 # and alerts on TP1 / TP2 / TP3 / SL. Polling stops when the trade closes.
 TRACK_INTERVAL  = int(os.environ.get("TRACK_INTERVAL", "120"))    # seconds between polls
 TRACK_MAX_HOURS = float(os.environ.get("TRACK_MAX_HOURS", "4"))   # stop tracking after this
+TRACK_TOLERANCE = float(os.environ.get("TRACK_TOLERANCE", "1.5"))  # TP counts as hit within this many points
+                                                                   # (broker and Twelve Data prices differ slightly)
 BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry as stop after TP1
 
 # ── KEEP-ALIVE SERVER ─────────────────────────────────────
@@ -232,19 +241,72 @@ def levels(entry, direction, bos_wick):
         risk = entry - sl
         return sl, entry + risk, entry + risk*2, entry + risk*3
 
-# ── S/R WARNING ───────────────────────────────────────────
-def sr_warning(candles, direction, entry):
-    if not candles or len(candles) < 20:
-        return ""
-    highs = [c["h"] for c in candles[:20]]
-    lows  = [c["l"] for c in candles[:20]]
-    resistance = max(highs)
-    support    = min(lows)
-    if direction == "BULLISH" and (resistance - entry) < 20:
-        return f"⚠️ Near resistance at {resistance:.2f}"
-    if direction == "BEARISH" and (entry - support) < 20:
-        return f"⚠️ Near support at {support:.2f}"
-    return ""
+# ── REAL S/R (confirmed swing points on H1 + H4) ──────────
+def _pivots(candles, strength=SR_STRENGTH):
+    """Swing highs/lows: a candle whose high (low) beats `strength` candles on
+    each side. Candles are newest-first, so the newest `strength` candles can
+    never be pivots, meaning the BOS/trigger candle itself is never a level."""
+    out = []
+    n = len(candles)
+    for i in range(strength, n - strength):
+        window = [j for j in range(i - strength, i + strength + 1) if j != i]
+        if all(candles[i]["h"] > candles[j]["h"] for j in window):
+            out.append(candles[i]["h"])
+        if all(candles[i]["l"] < candles[j]["l"] for j in window):
+            out.append(candles[i]["l"])
+    return out
+
+def sr_levels(h1, h4):
+    """Returns clustered levels: [{"price", "touches", "tf"}], sorted by price."""
+    pts = []
+    for tf, candles in (("H1", h1), ("H4", h4)):
+        if candles and len(candles) >= 2 * SR_STRENGTH + 1:
+            pts += [(price, tf) for price in _pivots(candles)]
+    pts.sort()
+    levels, group = [], []
+    for price, tf in pts:
+        if group and price - group[-1][0] > SR_CLUSTER:
+            levels.append(group); group = []
+        group.append((price, tf))
+    if group:
+        levels.append(group)
+    return [{"price": sum(p for p, _ in g) / len(g),
+             "touches": len(g),
+             "tf": "H4" if any(tf == "H4" for _, tf in g) else "H1"} for g in levels]
+
+def sr_summary(h1, h4, direction, entry):
+    """Text lines for the signal: nearest resistance above and support below
+    the entry (swing levels + round numbers). Informational only, it never
+    blocks a signal."""
+    levels = sr_levels(h1, h4)
+    if SR_ROUND_STEP > 0:
+        lower = (entry // SR_ROUND_STEP) * SR_ROUND_STEP
+        for price in (lower, lower + SR_ROUND_STEP):
+            if abs(price - entry) > 0.01:
+                levels.append({"price": price, "touches": 0, "tf": "ROUND"})
+
+    above = [l for l in levels if l["price"] > entry]
+    below = [l for l in levels if l["price"] < entry]
+    res = min(above, key=lambda l: l["price"]) if above else None
+    sup = max(below, key=lambda l: l["price"]) if below else None
+
+    def fmt(l):
+        dist = f"{l['price'] - entry:+.1f} pts"
+        if l["tf"] == "ROUND":
+            return f"{l['price']:.2f} ({dist}, round number)"
+        return f"{l['price']:.2f} ({dist}, {l['tf']}, x{l['touches']})"
+
+    def limit(l):
+        return SR_ROUND_WARN if l["tf"] == "ROUND" else SR_WARN_DIST
+
+    lines = ""
+    lines += f"Resistance   : {fmt(res)}\n" if res else "Resistance   : none found\n"
+    lines += f"Support      : {fmt(sup)}\n" if sup else "Support      : none found\n"
+    if direction == "BULLISH" and res and res["price"] - entry < limit(res):
+        lines += f"⚠️ Resistance {res['price'] - entry:.1f} pts ahead of entry\n"
+    if direction == "BEARISH" and sup and entry - sup["price"] < limit(sup):
+        lines += f"⚠️ Support {entry - sup['price']:.1f} pts ahead of entry\n"
+    return lines
 
 # ── CHOP SIGNAL (M15 range + M5 sweep & rejection) ────────
 def chop_signal(m15, m5, h1_macd=0.0):
@@ -359,7 +421,9 @@ def _r_mult(trade, price):
     return abs(price - trade["entry"]) / trade["risk"] if trade["risk"] > 0 else 0
 
 def _reached(trade, c, price):
-    return c["h"] >= price if trade["direction"] == "BUY" else c["l"] <= price
+    if trade["direction"] == "BUY":
+        return c["h"] >= price - TRACK_TOLERANCE
+    return c["l"] <= price + TRACK_TOLERANCE
 
 def _stopped(trade, c, level):
     return c["l"] <= level if trade["direction"] == "BUY" else c["h"] >= level
@@ -589,8 +653,7 @@ def scan():
         rr2        = round(abs(tp2 - entry) / risk, 1) if risk > 0 else 0
         emoji      = "🔴" if direction == "SELL" else "🟢"
         liq        = "✅" if liquidity_grab(m15, h4b) else "❌"
-        sr_warn    = sr_warning(h1, h4b, entry)
-        sr_line    = f"S/R Warning  : {sr_warn}\n" if sr_warn else ""
+        sr_line    = sr_summary(h1, h4, h4b, entry)
 
         msg = (
             f"{emoji} SIGNAL ALERT — {pair}\n"
