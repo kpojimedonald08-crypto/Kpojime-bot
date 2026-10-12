@@ -1,19 +1,82 @@
+"""
+KPOJIME BOT - one Render service.
+
+  Part 1  shared Twelve Data helper (call spacing + daily counter)
+  Part 2  Kpojime bot: trend signal (H1 BOS) + chop signal (M15 range / M5 sweep)
+          + trade tracker (TP / SL alerts)
+  Part 3  launcher: web server, self-ping, the bot, and an independent
+          heartbeat that keeps running while the bot sleeps or the API is down.
+          If the bot crashes it is restarted automatically.
+
+Start command stays: python sweep_bot.py
+"""
+
 import os
+import sys
 import time
 import threading
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ======================================================================
+# PART 1 - SHARED TWELVE DATA HELPER
+# Both bots use the same key, so every call goes through td_get():
+#   * calls are spaced MIN_GAP seconds apart (free plan: 8 requests/minute)
+#   * calls are counted per UTC day (free plan: 800 credits/day)
+# ======================================================================
+MIN_GAP = 8.0  # seconds between calls (max 7.5 calls/minute)
+
+_lock = threading.Lock()
+_last_call = 0.0
+_day = None
+_count = 0
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def td_get(url, params=None, timeout=15):
+    """requests.get() with spacing and a per-day call counter."""
+    global _last_call, _day, _count
+    with _lock:
+        wait = MIN_GAP - (time.time() - _last_call)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        finally:
+            _last_call = time.time()
+            today = _today()
+            if today != _day:
+                _day, _count = today, 0
+            _count += 1
+
+
+def calls_today():
+    """Number of Twelve Data calls made today (UTC) by both bots."""
+    return _count if _day == _today() else 0
+
+
+# ======================================================================
+# PART 2 - KPOJIME BOS BOT
+# ======================================================================
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+# Shown in the heartbeat
+status = {"last_scan": None, "api": "not called yet"}
 
 # ── ENV VARS ──────────────────────────────────────────────
-TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
-TWELVEDATA_KEY     = os.environ.get("TWELVEDATA_KEY")
+TWELVEDATA_KEY     = os.environ.get("TWELVEDATA_KEY") or os.environ.get("TWELVEDATA_API_KEY")
 SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "300"))
-RENDER_URL         = os.environ.get("RENDER_URL", "")
 PAIRS              = ["XAU/USD"]
 HEARTBEAT_INTERVAL = 7200
-PING_INTERVAL      = 600
 
 # ── DAILY SLEEP WINDOW (UTC) ──────────────────────────────
 # Bot sleeps from SLEEP_START_UTC until WAKE_UTC (saves Twelve Data credits
@@ -53,27 +116,14 @@ TRACK_TOLERANCE = float(os.environ.get("TRACK_TOLERANCE", "1.5"))  # TP counts a
                                                                    # (broker and Twelve Data prices differ slightly)
 BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry as stop after TP1
 
-# ── KEEP-ALIVE SERVER ─────────────────────────────────────
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Kpojime Bot running")
-    def log_message(self, *a): pass
+# ── PIPS ──────────────────────────────────────────────────
+# Price move that counts as 1 pip. Gold convention: 1 pip = 0.10 ($1 move = 10 pips).
+# If your broker counts 1 pip = 0.01, set PIP_SIZE=0.01 on Render.
+PIP_SIZE        = float(os.environ.get("PIP_SIZE", "0.1"))
 
-def run_server():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
-
-def self_ping():
-    while True:
-        time.sleep(PING_INTERVAL)
-        if RENDER_URL:
-            try:
-                requests.get(RENDER_URL, timeout=10)
-                print("Self-ping sent")
-            except Exception as e:
-                print(f"Ping error: {e}")
+def pips(a, b):
+    """Distance between two prices in pips."""
+    return int(round(abs(a - b) / PIP_SIZE))
 
 # ── TELEGRAM ──────────────────────────────────────────────
 def send(msg):
@@ -85,7 +135,7 @@ def send(msg):
 
 # ── WEEKEND CHECK ─────────────────────────────────────────
 def is_weekend():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Saturday = 5, Sunday = 6
     if now.weekday() == 5:
         return True
@@ -99,7 +149,7 @@ def is_weekend():
 
 # ── DAILY SLEEP CHECK ─────────────────────────────────────
 def in_daily_sleep(now=None):
-    now = now or datetime.utcnow()
+    now = now or _utcnow()
     h = now.hour
     if SLEEP_START_UTC < WAKE_UTC:
         return SLEEP_START_UTC <= h < WAKE_UTC
@@ -114,11 +164,13 @@ def fetch(symbol, interval, count=30):
             f"?symbol={symbol}&interval={interval}&outputsize={count}"
             f"&apikey={TWELVEDATA_KEY}&format=JSON"
         )
-        r = requests.get(url, timeout=15)
+        r = td_get(url, timeout=15)
         d = r.json()
         if d.get("status") == "error" or "values" not in d:
             print(f"Fetch error {symbol} {interval}: {d.get('message','no data')}")
+            status["api"] = f"ERROR at {_utcnow():%H:%M} UTC: {str(d.get('message','no data'))[:80]}"
             return None
+        status["api"] = f"OK at {_utcnow():%H:%M} UTC"
         return [
             {"t": v.get("datetime", ""),
              "o": float(v["open"]), "h": float(v["high"]),
@@ -127,10 +179,11 @@ def fetch(symbol, interval, count=30):
         ]
     except Exception as e:
         print(f"Fetch exception {symbol} {interval}: {e}")
+        status["api"] = f"ERROR at {_utcnow():%H:%M} UTC: {str(e)[:80]}"
         return None
 
 # ── EMA ───────────────────────────────────────────────────
-def ema(data, period):
+def bos_ema(data, period):
     k = 2 / (period + 1)
     val = sum(data[-period:]) / period
     for p in reversed(data[:-period]):
@@ -142,7 +195,7 @@ def bias(candles):
     if not candles or len(candles) < 26:
         return "NEUTRAL"
     closes = [c["c"] for c in candles]
-    macd = ema(closes, 12) - ema(closes, 26)
+    macd = bos_ema(closes, 12) - bos_ema(closes, 26)
     if macd > 0:
         return "BULLISH"
     elif macd < 0:
@@ -154,7 +207,7 @@ def macd_value(candles):
     if not candles or len(candles) < 26:
         return 0
     closes = [c["c"] for c in candles]
-    return ema(closes, 12) - ema(closes, 26)
+    return bos_ema(closes, 12) - bos_ema(closes, 26)
 
 # ── MARKET CONDITION ──────────────────────────────────────
 def market_condition(h4_candles, h1_candles):
@@ -222,7 +275,7 @@ def macd_aligned(candles, direction):
     if not candles or len(candles) < 26:
         return True
     closes = [c["c"] for c in candles]
-    macd = ema(closes, 12) - ema(closes, 26)
+    macd = bos_ema(closes, 12) - bos_ema(closes, 26)
     if direction == "BEARISH":
         return macd < 0
     if direction == "BULLISH":
@@ -443,7 +496,7 @@ def process_candle(t, c):
                  f"If you moved SL to entry, you're out at ~0R.")
         else:
             send(f"❌ STOP LOSS HIT — {head}\n"
-                 f"SL {t['sl']:.4f} touched (-1R). Trade closed.")
+                 f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
             if t["kind"] == "CHOP":
                 chop_state["losses"] += 1
                 if chop_state["losses"] >= CHOP_MAX_LOSSES:
@@ -469,7 +522,7 @@ def process_candle(t, c):
         else:
             tail = "👉 Consider closing part or trailing your stop."
         send(f"✅ {name} HIT — {head}\n"
-             f"Price reached {price:.4f} (+{_r_mult(t, price):.1f}R)\n{tail}")
+             f"Price reached {price:.4f} (+{_r_mult(t, price):.1f}R, +{pips(t['entry'], price)} pips)\n{tail}")
         if final:
             return True
     return False
@@ -513,7 +566,7 @@ sleep_notified    = False
 def scan():
     global last_heartbeat, sleep_notified
     now_ts  = time.time()
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now_str = _utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     # ── WEEKEND CHECK ─────────────────────────────────────
     if is_weekend():
@@ -542,6 +595,7 @@ def scan():
 
         if not h4 or not h1 or not m15 or not m5:
             print(f"{pair}: Missing data — skip"); continue
+        status["last_scan"] = _utcnow()
 
         condition, h4_macd, r_high, r_low = market_condition(h4, h1)
 
@@ -597,13 +651,14 @@ def scan():
                     f"━━━━━━━━━━━━━━━━\n"
                     f"Direction : {chop['direction']}\n"
                     f"Entry     : {chop['entry']:.4f}\n"
-                    f"Stop Loss : {chop['sl']:.4f}\n"
-                    f"TP1 (mid) : {chop['tp1']:.4f}\n"
-                    f"TP2 (edge): {chop['tp2']:.4f}\n"
+                    f"Stop Loss : {chop['sl']:.4f}  ({pips(chop['entry'], chop['sl'])} pips)\n"
+                    f"TP1 (mid) : {chop['tp1']:.4f}  ({pips(chop['entry'], chop['tp1'])} pips)\n"
+                    f"TP2 (edge): {chop['tp2']:.4f}  ({pips(chop['entry'], chop['tp2'])} pips)\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"Setup        : M5 sweep of {chop['swept']} + rejection\n"
                     f"M15 Range    : {chop['r_low']:.2f} — {chop['r_high']:.2f}\n"
                     f"R:R (TP2)    : 1:{chop['rr2']}\n"
+                    f"Pip size     : {PIP_SIZE:g}\n"
                     f"Time         : {now_str}\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"⚠️ Range trade, not a trend trade. Take profit early, size smaller."
@@ -660,10 +715,10 @@ def scan():
             f"━━━━━━━━━━━━━━━━\n"
             f"Direction : {direction}\n"
             f"Entry     : {entry:.4f}\n"
-            f"Stop Loss : {sl:.4f}\n"
-            f"TP1 (1:1) : {tp1:.4f}\n"
-            f"TP2 (1:2) : {tp2:.4f}\n"
-            f"TP3 (1:3) : {tp3:.4f}\n"
+            f"Stop Loss : {sl:.4f}  ({pips(entry, sl)} pips)\n"
+            f"TP1 (1:1) : {tp1:.4f}  ({pips(entry, tp1)} pips)\n"
+            f"TP2 (1:2) : {tp2:.4f}  ({pips(entry, tp2)} pips)\n"
+            f"TP3 (1:3) : {tp3:.4f}  ({pips(entry, tp3)} pips)\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"H4 Bias      : {h4b}\n"
             f"H1 BOS       : ✅\n"
@@ -673,6 +728,7 @@ def scan():
             f"Liq. Grab    : {liq}\n"
             f"{sr_line}"
             f"R:R (TP2)    : 1:{rr2}\n"
+            f"Pip size     : {PIP_SIZE:g}\n"
             f"Time         : {now_str}\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"⚠️ Confirm on chart. Use 2% risk."
@@ -683,15 +739,14 @@ def scan():
                   [("TP1", tp1), ("TP2", tp2), ("TP3", tp3)])
         print(f"{pair}: Signal sent: {direction} @ {entry:.4f}")
 
-# ── MAIN ──────────────────────────────────────────────────
-if __name__ == "__main__":
+# ── MAIN LOOP (started by sweep_bot.py) ───────────────────
+def run_kpojime(announce=True):
     print("Kpojime Bot starting...")
-    threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=self_ping,  daemon=True).start()
-    send(f"🚀 Kpojime Bot STARTED\n"
-         f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
-         f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
-         f"Heartbeat every 2 hours.")
+    if announce:
+        send(f"🚀 Kpojime Bot STARTED\n"
+             f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
+             f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
+             f"Heartbeat every 2 hours.")
     next_scan = 0
     while True:
         if time.time() >= next_scan:
@@ -713,3 +768,119 @@ if __name__ == "__main__":
         else:
             wait = max(1, next_scan - time.time())
         time.sleep(wait)
+
+
+# ======================================================================
+# PART 3 - LAUNCHER
+# ======================================================================
+
+PING_INTERVAL = 600
+
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Kpojime Bot alive")
+
+    def log_message(self, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def start_self_ping():
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_URL")
+    if not url:
+        print("No RENDER_EXTERNAL_URL set: self-ping disabled")
+        return
+
+    def loop():
+        while True:
+            time.sleep(PING_INTERVAL)
+            try:
+                requests.get(url, timeout=10)
+                print("Self-ping sent")
+            except Exception as e:
+                print(f"Ping error: {e}")
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def alert(text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"Alert error: {e}")
+
+
+def supervise(name, fn):
+    """Run one bot forever. If it crashes, tell Telegram and restart it
+    without touching the other bot."""
+    first = True
+    while True:
+        try:
+            fn(first)
+        except Exception as e:
+            print(f"{name} crashed: {e}")
+            alert(f"⚠️ {name} crashed and is restarting: {str(e)[:100]}")
+        first = False
+        time.sleep(60)
+
+
+HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "6"))
+
+
+def build_heartbeat():
+    now = _utcnow()
+    if is_weekend():
+        mode = "sleeping (market closed)"
+    elif in_daily_sleep():
+        mode = f"sleeping (until {WAKE_UTC:02d}:00 UTC)"
+    else:
+        mode = "scanning"
+    last = f"{status['last_scan']:%Y-%m-%d %H:%M} UTC" if status["last_scan"] else "none yet"
+    return (
+        f"💓 Kpojime Bot alive\n"
+        f"Time: {now:%Y-%m-%d %H:%M} UTC\n"
+        f"Mode: {mode}\n"
+        f"Last scan: {last}\n"
+        f"Data API: {status['api']}\n"
+        f"Open trades tracked: {len(active_trades)}\n"
+        f"Twelve Data calls today: {calls_today()}"
+    )
+
+
+def start_heartbeat():
+    """Independent of the scan loop: still sends while the bot sleeps or the
+    data API is failing."""
+    def loop():
+        while True:
+            time.sleep(HEARTBEAT_HOURS * 3600)
+            try:
+                send(build_heartbeat())
+            except Exception as e:
+                print(f"Heartbeat error: {e}")
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def main():
+    print("Launcher starting: Kpojime bot (trend + chop)")
+    start_health_server()
+    start_self_ping()
+    start_heartbeat()
+    threading.Thread(target=supervise, args=("Kpojime bot", run_kpojime), daemon=True).start()
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
