@@ -3,6 +3,9 @@ KPOJIME BOT - one Render service.
 
   Part 1  shared Twelve Data helper (call spacing + daily counter)
   Part 2  Kpojime bot: trend signal (H1 BOS) + chop signal (M15 range / M5 sweep)
+          + tight-market signals (M30 squeeze box, M15 break, M5 trigger):
+            TIGHT BREAKOUT  = break holds, M5 retest rejects the edge
+            TIGHT FAKE-OUT  = break fails, price closes back inside the box
           + trade tracker (TP / SL alerts)
   Part 3  launcher: web server, self-ping, the bot, and an independent
           heartbeat that keeps running while the bot sleeps or the API is down.
@@ -99,6 +102,24 @@ CHOP_MIN_TOUCHES = int(os.environ.get("CHOP_MIN_TOUCHES", "2"))      # candles t
 CHOP_EDGE_ZONE   = 0.2                                               # edge zone = 20% of range width
 CHOP_MAX_LOSSES  = int(os.environ.get("CHOP_MAX_LOSSES", "2"))       # consecutive chop SLs before pausing
 CHOP_PAUSE_HOURS = float(os.environ.get("CHOP_PAUSE_HOURS", "3"))
+
+# ── TIGHT-MARKET SIGNAL SETTINGS ──────────────────────────
+# Separate from the trend and chop signals. Turn the whole thing off with
+# TIGHT_ENABLED=0, or just one of the two with TIGHT_BREAKOUT=0 / TIGHT_FAKEOUT=0.
+TIGHT_ENABLED    = os.environ.get("TIGHT_ENABLED", "1") == "1"
+TIGHT_BREAKOUT   = os.environ.get("TIGHT_BREAKOUT", "1") == "1"
+TIGHT_FAKEOUT    = os.environ.get("TIGHT_FAKEOUT", "1") == "1"
+TIGHT_BARS       = int(os.environ.get("TIGHT_BARS", "5"))          # M30 bars in the squeeze (5 = 2.5h); box = last 2x this many M15 candles
+TIGHT_WINDOW     = int(os.environ.get("TIGHT_WINDOW", "4"))        # newest M15 candles where a break may happen (4 = 1h)
+TIGHT_SQUEEZE    = float(os.environ.get("TIGHT_SQUEEZE", "0.7"))   # avg M30 range must be <= this x the previous stretch
+TIGHT_MIN_BOX    = float(os.environ.get("TIGHT_MIN_BOX", "8"))     # box height limits (gold points)
+TIGHT_MAX_BOX    = float(os.environ.get("TIGHT_MAX_BOX", "35"))
+TIGHT_RETEST_TOL = float(os.environ.get("TIGHT_RETEST_TOL", "3"))  # M5 must come back within this many points of the broken edge
+TIGHT_SL_BUFFER  = float(os.environ.get("TIGHT_SL_BUFFER", "3"))
+TIGHT_MAX_RISK   = float(os.environ.get("TIGHT_MAX_RISK", "25"))   # skip if stop is wider than this (points)
+TIGHT_MIN_RR     = float(os.environ.get("TIGHT_MIN_RR", "1.0"))    # fake-out only: minimum R:R to TP2
+TIGHT_COOLDOWN   = float(os.environ.get("TIGHT_COOLDOWN", "7200")) # seconds; roughly one signal per box
+TIGHT_H1_ALIGN   = os.environ.get("TIGHT_H1_ALIGN", "0") == "1"    # 1 = breakout must agree with H1 MACD direction
 
 # ── REAL SUPPORT / RESISTANCE SETTINGS ────────────────────
 SR_WARN_DIST = float(os.environ.get("SR_WARN_DIST", "20"))   # warn if a level is closer than this (points)
@@ -457,6 +478,158 @@ def chop_signal(m15, m5, h1_macd=0.0):
 
     return None
 
+# ── TIGHT-MARKET SIGNALS (M30 squeeze box / M15 break / M5 trigger) ──
+def _m30_from_m15(m15):
+    """Builds M30 candles from M15 candles (newest-first in, newest-first out).
+    Only complete pairs (:00 + :15, or :30 + :45) are used. No extra API calls."""
+    buckets, order = {}, []
+    for c in m15:
+        t = c.get("t", "")
+        try:
+            minute = int(t[14:16])
+        except (ValueError, IndexError):
+            continue
+        key = t[:14] + ("00" if minute < 30 else "30")
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(c)
+    out = []
+    for key in order:
+        cs = buckets[key]
+        if len(cs) != 2:
+            continue
+        out.append({"t": key,
+                    "o": cs[-1]["o"], "c": cs[0]["c"],
+                    "h": max(x["h"] for x in cs), "l": min(x["l"] for x in cs)})
+    return out
+
+def tight_box(m15):
+    """Finds a tight box: the last 2*TIGHT_BARS M15 candles that sit just before
+    the newest TIGHT_WINDOW candles, but only when the M30 candles in that stretch
+    are clearly smaller than the M30 candles before it (a squeeze).
+    Returns {"high", "low", "mid", "width"} or None."""
+    need = TIGHT_WINDOW + 4 * TIGHT_BARS
+    if not m15 or len(m15) < TIGHT_WINDOW + 2 * TIGHT_BARS:
+        return None
+    older = m15[TIGHT_WINDOW:]
+    m30 = _m30_from_m15(older)
+    if len(m30) < 2 * TIGHT_BARS:
+        return None
+    recent_m30 = m30[:TIGHT_BARS]
+    prior_m30  = m30[TIGHT_BARS:2 * TIGHT_BARS]
+    avg = lambda xs: sum(c["h"] - c["l"] for c in xs) / len(xs)
+    if avg(recent_m30) > TIGHT_SQUEEZE * avg(prior_m30):
+        return None          # no squeeze: candles are not getting smaller
+    box = older[:2 * TIGHT_BARS]
+    hi = max(c["h"] for c in box)
+    lo = min(c["l"] for c in box)
+    width = hi - lo
+    if width < TIGHT_MIN_BOX or width > TIGHT_MAX_BOX:
+        return None
+    return {"high": hi, "low": lo, "mid": (hi + lo) / 2, "width": width}
+
+def tight_signals(m15, m5, h1_macd=0.0):
+    """
+    TIGHT BREAKOUT: an M15 candle closed outside the box, no M15 candle has
+      closed back inside since, and an M5 candle retested the broken edge and
+      closed away from it in the break direction.
+    TIGHT FAKE-OUT: an M15 candle closed outside the box, then a later M15
+      candle closed back inside; an M5 candle confirms the move back.
+    Uses candles already fetched for the other signals (no extra API calls).
+    Returns a list of signal dicts (usually empty).
+    """
+    box = tight_box(m15)
+    if not box or not m5 or len(m5) < 3 or len(m15) < TIGHT_WINDOW:
+        return []
+    hi, lo, mid, width = box["high"], box["low"], box["mid"], box["width"]
+
+    win   = m15[:TIGHT_WINDOW]            # newest first
+    entry = m5[0]["c"]
+    last5 = m5[:3]
+    bullish_m5 = m5[0]["c"] > m5[0]["o"]
+    bearish_m5 = m5[0]["c"] < m5[0]["o"]
+
+    # first (oldest) M15 close outside the box inside the window
+    brk = None
+    for i in range(len(win) - 1, -1, -1):
+        if win[i]["c"] > hi:
+            brk = ("UP", i)
+            break
+        if win[i]["c"] < lo:
+            brk = ("DOWN", i)
+            break
+    if not brk:
+        return []
+    side, i = brk
+    up = side == "UP"
+    since_break = win[:i + 1]             # break candle and everything after it
+
+    held = all((c["c"] > hi) if up else (c["c"] < lo) for c in since_break)
+    out = []
+
+    if held:
+        # ── BREAKOUT: break still holds; trade the M5 retest of the edge ──
+        if not TIGHT_BREAKOUT:
+            return []
+        if up:
+            probe   = min(c["l"] for c in last5)
+            touched = probe <= hi + TIGHT_RETEST_TOL
+            good    = entry > hi and bullish_m5
+            sl      = min(probe - TIGHT_SL_BUFFER, hi - 0.3 * width)
+            risk    = entry - sl
+            aligned = (not TIGHT_H1_ALIGN) or h1_macd > 0
+        else:
+            probe   = max(c["h"] for c in last5)
+            touched = probe >= lo - TIGHT_RETEST_TOL
+            good    = entry < lo and bearish_m5
+            sl      = max(probe + TIGHT_SL_BUFFER, lo + 0.3 * width)
+            risk    = sl - entry
+            aligned = (not TIGHT_H1_ALIGN) or h1_macd < 0
+        if touched and good and aligned and 0 < risk <= TIGHT_MAX_RISK:
+            sign = 1 if up else -1
+            tps = [("TP1", entry + sign * risk),
+                   ("TP2", entry + sign * risk * 2),
+                   ("TP3", entry + sign * risk * 3)]
+            out.append({"kind": "TIGHT BREAKOUT",
+                        "direction": "BUY" if up else "SELL",
+                        "entry": entry, "sl": sl, "tps": tps, "rr2": 2.0,
+                        "box": box,
+                        "setup": f"M15 closed {'above' if up else 'below'} box + M5 retest of the {'high' if up else 'low'}"})
+        return out
+
+    # ── FAKE-OUT: broke out, then closed back inside the box ──
+    if not TIGHT_FAKEOUT:
+        return []
+    if i == 0 or not (lo <= win[0]["c"] <= hi):
+        return []
+    if up:
+        extreme = max(c["h"] for c in since_break)
+        if not (entry < hi and entry > mid and bearish_m5):
+            return []
+        sl   = extreme + TIGHT_SL_BUFFER
+        risk = sl - entry
+        tp1, tp2 = mid, lo
+        rr2  = (entry - tp2) / risk if risk > 0 else 0
+        direction = "SELL"
+        setup = "M15 broke above the box, closed back inside + M5 rejection"
+    else:
+        extreme = min(c["l"] for c in since_break)
+        if not (entry > lo and entry < mid and bullish_m5):
+            return []
+        sl   = extreme - TIGHT_SL_BUFFER
+        risk = entry - sl
+        tp1, tp2 = mid, hi
+        rr2  = (tp2 - entry) / risk if risk > 0 else 0
+        direction = "BUY"
+        setup = "M15 broke below the box, closed back inside + M5 rejection"
+    if 0 < risk <= TIGHT_MAX_RISK and rr2 >= TIGHT_MIN_RR:
+        out.append({"kind": "TIGHT FAKE-OUT", "direction": direction,
+                    "entry": entry, "sl": sl,
+                    "tps": [("TP1", tp1), ("TP2", tp2)], "rr2": round(rr2, 1),
+                    "box": box, "setup": setup})
+    return out
+
 # ── TRADE TRACKER ─────────────────────────────────────────
 active_trades = []
 chop_state = {"losses": 0, "paused_until": 0}
@@ -639,6 +812,50 @@ def scan():
                 )
             send(hb_msg)
             last_heartbeat = now_ts
+
+        # ── TIGHT-MARKET SIGNALS (separate from trend + chop) ──
+        # Runs before the chop block and never skips the rest of the scan,
+        # so trend and chop behave exactly as before.
+        if TIGHT_ENABLED:
+            try:
+                for sig in tight_signals(m15, m5, macd_value(h1)):
+                    is_break  = sig["kind"] == "TIGHT BREAKOUT"
+                    break_key = f"{pair}_tight_break"
+                    fake_key  = f"{pair}_tight_fake"
+                    key       = break_key if is_break else fake_key
+                    if now_ts - last_signal_time.get(key, 0) < TIGHT_COOLDOWN:
+                        continue
+                    # a breakout never fires after a fake-out on the same box
+                    if is_break and now_ts - last_signal_time.get(fake_key, 0) < TIGHT_COOLDOWN:
+                        continue
+                    b = sig["box"]
+                    emoji = "🔴" if sig["direction"] == "SELL" else "🟢"
+                    tp_lines = "".join(
+                        f"{name:<10}: {price:.4f}  ({pips(sig['entry'], price)} pips)\n"
+                        for name, price in sig["tps"]
+                    )
+                    msg = (
+                        f"{emoji} {sig['kind']} — {pair}\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"Direction : {sig['direction']}\n"
+                        f"Entry     : {sig['entry']:.4f}\n"
+                        f"Stop Loss : {sig['sl']:.4f}  ({pips(sig['entry'], sig['sl'])} pips)\n"
+                        f"{tp_lines}"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"Setup        : {sig['setup']}\n"
+                        f"Tight box    : {b['low']:.2f} — {b['high']:.2f}  ({b['width']:.1f} pts)\n"
+                        f"R:R (TP2)    : 1:{sig['rr2']}\n"
+                        f"Pip size     : {PIP_SIZE:g}\n"
+                        f"Time         : {now_str}\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ Confirm on chart. Use 2% risk."
+                    )
+                    send(msg)
+                    last_signal_time[key] = now_ts
+                    add_trade(pair, sig["kind"], sig["direction"], sig["entry"], sig["sl"], sig["tps"])
+                    print(f"{pair}: {sig['kind']} sent: {sig['direction']} @ {sig['entry']:.4f}")
+            except Exception as e:
+                print(f"{pair}: tight signal error: {e}")
 
         # ── CHOP SIGNAL (only when market is choppy) ──────
         if CHOP_ENABLED and condition == "CHOPPY" and now_ts >= chop_state["paused_until"]:
@@ -873,7 +1090,7 @@ def start_heartbeat():
 
 
 def main():
-    print("Launcher starting: Kpojime bot (trend + chop)")
+    print("Launcher starting: Kpojime bot (trend + chop + tight)")
     start_health_server()
     start_self_ping()
     start_heartbeat()
