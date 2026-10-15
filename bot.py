@@ -16,6 +16,7 @@ Start command stays: python sweep_bot.py
 
 import os
 import sys
+import csv
 import time
 import threading
 from datetime import datetime, timedelta, timezone
@@ -142,6 +143,15 @@ BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry 
 # never to TIGHT or CHOP). A trade stays "open" until its final TP, SL or
 # breakeven alert, even after TP1. Set TREND_MAX_OPEN=0 on Render to turn it off.
 TREND_MAX_OPEN  = int(os.environ.get("TREND_MAX_OPEN", "1"))
+
+# ── TRADE LOG ─────────────────────────────────────────────
+# Every closed trade is written to a CSV and summarised on Telegram when the bot
+# goes to sleep (13:00 UTC). Trend signals blocked by TREND_MAX_OPEN are tracked
+# silently ("TREND (SKIPPED)") so you can see whether the rule blocked winners.
+# NOTE: Render's free plan wipes files on every deploy/restart, so the daily CSV
+# sent to Telegram is your permanent copy.
+TRADE_LOG_PATH     = os.environ.get("TRADE_LOG_PATH", "/tmp/trade_log.csv")
+TRADE_LOG_SEND_CSV = os.environ.get("TRADE_LOG_SEND_CSV", "1") == "1"
 
 # ── PIPS ──────────────────────────────────────────────────
 # Price move that counts as 1 pip. Gold convention: 1 pip = 0.10 ($1 move = 10 pips).
@@ -387,6 +397,21 @@ def sr_summary(h1, h4, direction, entry):
     if direction == "BEARISH" and sup and entry - sup["price"] < limit(sup):
         lines += f"⚠️ Support {entry - sup['price']:.1f} pts ahead of entry\n"
     return lines
+
+def sr_nearest(h1, h4, entry):
+    """Distance in points to the nearest resistance above and support below the
+    entry (same levels as sr_summary). Used only for the trade log."""
+    lv = sr_levels(h1, h4)
+    if SR_ROUND_STEP > 0:
+        lower = (entry // SR_ROUND_STEP) * SR_ROUND_STEP
+        for price in (lower, lower + SR_ROUND_STEP):
+            if abs(price - entry) > 0.01:
+                lv.append({"price": price, "touches": 0, "tf": "ROUND"})
+    above = [l["price"] for l in lv if l["price"] > entry]
+    below = [l["price"] for l in lv if l["price"] < entry]
+    res = round(min(above) - entry, 1) if above else ""
+    sup = round(entry - max(below), 1) if below else ""
+    return res, sup
 
 # ── CHOP SIGNAL (M15 range + M5 sweep & rejection) ────────
 def chop_signal(m15, m5, h1_macd=0.0):
@@ -639,12 +664,15 @@ def tight_signals(m15, m5, h1_macd=0.0):
 active_trades = []
 chop_state = {"losses": 0, "paused_until": 0}
 
-def add_trade(pair, kind, direction, entry, sl, tps):
-    """tps = [("TP1", price), ("TP2", price), ...] in order."""
+def add_trade(pair, kind, direction, entry, sl, tps, meta=None, shadow=False):
+    """tps = [("TP1", price), ("TP2", price), ...] in order.
+    shadow=True tracks a trade silently (no Telegram alerts), log only."""
     active_trades.append({
         "pair": pair, "kind": kind, "direction": direction,
         "entry": entry, "sl": sl, "risk": abs(entry - sl),
         "tps": tps, "hit": 0, "base_t": None, "created": time.time(),
+        "opened": _utcnow().strftime("%Y-%m-%d %H:%M"),
+        "meta": meta or {}, "shadow": shadow,
     })
     print(f"{pair}: tracking {kind} {direction} @ {entry:.4f}")
 
@@ -659,8 +687,157 @@ def _reached(trade, c, price):
 def _stopped(trade, c, level):
     return c["l"] <= level if trade["direction"] == "BUY" else c["h"] >= level
 
+# ── TRADE LOG ─────────────────────────────────────────────
+LOG_FIELDS = ["opened_utc", "closed_utc", "pair", "kind", "direction", "entry", "sl",
+              "risk_pips", "outcome", "tps_hit", "r_hold", "r_tp1", "pips_hold",
+              "pips_tp1", "condition", "box_or_range", "liq_grab", "res_pts",
+              "sup_pts", "h1_macd"]
+trade_log = []        # closed trades (dicts), oldest first
+log_cursor = 0        # trades before this index were already in a daily summary
+_log_loaded = False
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+def _r_of(t, price):
+    return abs(price - t["entry"]) / t["risk"] if t["risk"] > 0 else 0.0
+
+def _load_trade_log():
+    """Reads the CSV (if it survived) once at startup."""
+    global log_cursor, _log_loaded
+    if _log_loaded:
+        return
+    _log_loaded = True
+    try:
+        if os.path.exists(TRADE_LOG_PATH):
+            with open(TRADE_LOG_PATH, newline="") as f:
+                for row in csv.DictReader(f):
+                    for k in ("r_hold", "r_tp1", "pips_hold", "pips_tp1"):
+                        row[k] = _num(row.get(k))
+                    trade_log.append(row)
+    except Exception as e:
+        print(f"Trade log load error: {e}")
+    log_cursor = len(trade_log)
+
+def log_trade(t, outcome):
+    """outcome: SL | BE | TP_FINAL | TIMEOUT | WEEKEND.
+    r_hold   = result if you hold with the stop at entry after TP1 (what the bot tracks)
+    r_tp1    = result if you close everything at TP1 (SL = -1R if TP1 never came)
+    Never raises, so a logging problem can't stop the bot."""
+    try:
+        m = t.get("meta", {})
+        hit = t["hit"]
+        risk_pips = pips(t["entry"], t["sl"])
+        r1 = _r_of(t, t["tps"][0][1]) if t["tps"] else None
+        if outcome == "SL":
+            r_hold = -1.0
+        elif outcome == "BE":
+            r_hold = 0.0
+        elif outcome == "TP_FINAL":
+            r_hold = _r_of(t, t["tps"][-1][1])
+        else:
+            r_hold = None
+        if hit >= 1:
+            r_tp1 = r1
+        elif outcome == "SL":
+            r_tp1 = -1.0
+        else:
+            r_tp1 = None
+        row = {
+            "opened_utc": t.get("opened", ""),
+            "closed_utc": _utcnow().strftime("%Y-%m-%d %H:%M"),
+            "pair": t["pair"],
+            "kind": t["kind"] + (" (SKIPPED)" if t.get("shadow") else ""),
+            "direction": t["direction"],
+            "entry": round(t["entry"], 2), "sl": round(t["sl"], 2),
+            "risk_pips": risk_pips, "outcome": outcome, "tps_hit": hit,
+            "r_hold": None if r_hold is None else round(r_hold, 2),
+            "r_tp1": None if r_tp1 is None else round(r_tp1, 2),
+            "pips_hold": None if r_hold is None else round(r_hold * risk_pips),
+            "pips_tp1": None if r_tp1 is None else round(r_tp1 * risk_pips),
+            "condition": m.get("cond", ""), "box_or_range": m.get("size", ""),
+            "liq_grab": m.get("liq", ""), "res_pts": m.get("res", ""),
+            "sup_pts": m.get("sup", ""), "h1_macd": m.get("h1macd", ""),
+        }
+        trade_log.append(row)
+        new_file = not os.path.exists(TRADE_LOG_PATH)
+        with open(TRADE_LOG_PATH, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        print(f"Trade log error: {e}")
+
+def _fmt_r(x):
+    return "n/a" if x is None else f"{x:+.1f}R"
+
+def _label(r):
+    hit = int(_num(r.get("tps_hit")) or 0)
+    o = r["outcome"]
+    if o == "SL":
+        return "SL -1.0R"
+    if o == "BE":
+        return f"TP{hit} then BE"
+    if o == "TP_FINAL":
+        return f"TP{hit} {_fmt_r(r['r_hold'])}"
+    return f"{o.lower()} (TP{hit})"
+
+def _group_stats(rows):
+    done = [r for r in rows if r["r_hold"] is not None]
+    wins = sum(1 for r in done if r["r_hold"] > 0)
+    be   = sum(1 for r in done if r["r_hold"] == 0)
+    loss = sum(1 for r in done if r["r_hold"] < 0)
+    hold = sum(r["r_hold"] for r in done)
+    pip_hold = sum((r["pips_hold"] or 0) for r in done)
+    tp1 = sum(r["r_tp1"] for r in rows if r["r_tp1"] is not None)
+    return len(rows), wins, be, loss, hold, pip_hold, tp1
+
+def send_log_file():
+    try:
+        with open(TRADE_LOG_PATH, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID},
+                          files={"document": ("trade_log.csv", f)}, timeout=30)
+    except Exception as e:
+        print(f"Log file send error: {e}")
+
+def send_daily_log():
+    """Telegram summary of trades closed since the last summary + running totals."""
+    global log_cursor
+    try:
+        new = trade_log[log_cursor:]
+        log_cursor = len(trade_log)
+        if not new:
+            return
+        lines = [f"📒 TRADE LOG — {_utcnow():%Y-%m-%d}",
+                 f"Closed since last log: {len(new)}"]
+        for r in new[:15]:
+            pp = r.get("pips_hold")
+            tail = f" ({int(pp):+d} pips)" if pp is not None else ""
+            lines.append(f"• {str(r['opened_utc'])[11:16]} {r['kind']} {r['direction']}: {_label(r)}{tail}")
+        if len(new) > 15:
+            lines.append(f"... and {len(new) - 15} more (see CSV)")
+        lines.append("— All logged trades —")
+        kinds = []
+        for r in trade_log:
+            if r["kind"] not in kinds:
+                kinds.append(r["kind"])
+        for k in kinds:
+            n, w, be, l, hold, pip_hold, tp1 = _group_stats([r for r in trade_log if r["kind"] == k])
+            lines.append(f"{k}: {n} | W{w} BE{be} L{l} | hold {hold:+.1f}R ({pip_hold:+.0f} pips) | close-at-TP1 {tp1:+.1f}R")
+        send("\n".join(lines)[:3900])
+        if TRADE_LOG_SEND_CSV and os.path.exists(TRADE_LOG_PATH):
+            send_log_file()
+    except Exception as e:
+        print(f"Daily log error: {e}")
+
 def process_candle(t, c):
     """Returns True when the trade is finished."""
+    say  = (lambda m: None) if t.get("shadow") else send
     head = f"{t['pair']} {t['direction']} ({t['kind']})"
     be   = BE_AFTER_TP1 and t["hit"] >= 1
     stop = t["entry"] if be else t["sl"]
@@ -669,12 +846,14 @@ def process_candle(t, c):
     # as a loss (conservative).
     if _stopped(t, c, stop):
         if be:
-            send(f"🟡 BREAKEVEN — {head}\n"
-                 f"Price back at entry {t['entry']:.4f} after TP1.\n"
-                 f"If you moved SL to entry, you're out at ~0R.")
+            say(f"🟡 BREAKEVEN — {head}\n"
+                f"Price back at entry {t['entry']:.4f} after TP1.\n"
+                f"If you moved SL to entry, you're out at ~0R.")
+            log_trade(t, "BE")
         else:
-            send(f"❌ STOP LOSS HIT — {head}\n"
-                 f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
+            say(f"❌ STOP LOSS HIT — {head}\n"
+                f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
+            log_trade(t, "SL")
             if t["kind"] == "CHOP":
                 chop_state["losses"] += 1
                 if chop_state["losses"] >= CHOP_MAX_LOSSES:
@@ -699,9 +878,10 @@ def process_candle(t, c):
             tail = f"👉 Move SL to entry ({t['entry']:.4f}) to protect the trade."
         else:
             tail = "👉 Consider closing part or trailing your stop."
-        send(f"✅ {name} HIT — {head}\n"
-             f"Price reached {price:.4f} (+{_r_mult(t, price):.1f}R, +{pips(t['entry'], price)} pips)\n{tail}")
+        say(f"✅ {name} HIT — {head}\n"
+            f"Price reached {price:.4f} (+{_r_mult(t, price):.1f}R, +{pips(t['entry'], price)} pips)\n{tail}")
         if final:
+            log_trade(t, "TP_FINAL")
             return True
     return False
 
@@ -712,8 +892,10 @@ def track_trades():
 
     for t in active_trades[:]:
         if now_ts - t["created"] > TRACK_MAX_HOURS * 3600:
-            send(f"⏱ Tracking stopped — {t['pair']} {t['direction']} ({t['kind']})\n"
-                 f"Open for over {TRACK_MAX_HOURS:g}h with no final result. Manage it manually.")
+            if not t.get("shadow"):
+                send(f"⏱ Tracking stopped — {t['pair']} {t['direction']} ({t['kind']})\n"
+                     f"Open for over {TRACK_MAX_HOURS:g}h with no final result. Manage it manually.")
+            log_trade(t, "TIMEOUT")
             active_trades.remove(t)
 
     for pair in {t["pair"] for t in active_trades}:
@@ -758,6 +940,7 @@ def scan():
                  f"No scans until {WAKE_UTC:02d}:00 UTC.\n"
                  f"Time: {now_str}")
             sleep_notified = True
+            send_daily_log()
         print(f"Daily sleep window ({SLEEP_START_UTC:02d}:00-{WAKE_UTC:02d}:00 UTC) — skipping scan")
         return
     if sleep_notified:
@@ -857,7 +1040,8 @@ def scan():
                     )
                     send(msg)
                     last_signal_time[key] = now_ts
-                    add_trade(pair, sig["kind"], sig["direction"], sig["entry"], sig["sl"], sig["tps"])
+                    add_trade(pair, sig["kind"], sig["direction"], sig["entry"], sig["sl"], sig["tps"],
+                              meta={"cond": condition, "size": round(b["width"], 1)})
                     print(f"{pair}: {sig['kind']} sent: {sig['direction']} @ {sig['entry']:.4f}")
             except Exception as e:
                 print(f"{pair}: tight signal error: {e}")
@@ -888,7 +1072,9 @@ def scan():
                 send(msg)
                 last_signal_time[chop_key] = now_ts
                 add_trade(pair, "CHOP", chop["direction"], chop["entry"], chop["sl"],
-                          [("TP1", chop["tp1"]), ("TP2", chop["tp2"])])
+                          [("TP1", chop["tp1"]), ("TP2", chop["tp2"])],
+                          meta={"cond": condition,
+                                "size": round(chop["r_high"] - chop["r_low"], 1)})
                 print(f"{pair}: CHOP signal sent: {chop['direction']} @ {chop['entry']:.4f}")
                 continue
 
@@ -928,7 +1114,7 @@ def scan():
             side = "SELL" if h4b == "BEARISH" else "BUY"
             open_same = sum(1 for t in active_trades
                             if t["kind"] == "TREND" and t["pair"] == pair
-                            and t["direction"] == side)
+                            and t["direction"] == side and not t.get("shadow"))
             if open_same >= TREND_MAX_OPEN:
                 print(f"{pair}: {open_same} trend {side} already open — skip")
                 skip_key = f"{pair}_trend_skip_{side}"
@@ -936,8 +1122,22 @@ def scan():
                     send(f"⏭ TREND {side} skipped — {pair}\n"
                          f"A trend {side} is still open, so no new one was sent.\n"
                          f"Would-be entry: {m5[0]['c']:.4f}\n"
+                         f"I'll track it silently and show how it ended in the daily log.\n"
                          f"Time: {now_str}")
                     last_signal_time[skip_key] = now_ts
+                    try:
+                        s_entry = m5[0]["c"]
+                        s_sl, s_tp1, s_tp2, s_tp3 = levels(s_entry, h4b, h1_wick if h1_wick else s_entry)
+                        s_res, s_sup = sr_nearest(h1, h4, s_entry)
+                        add_trade(pair, "TREND", side, s_entry, s_sl,
+                                  [("TP1", s_tp1), ("TP2", s_tp2), ("TP3", s_tp3)],
+                                  meta={"cond": condition,
+                                        "liq": "yes" if liquidity_grab(m15, h4b) else "no",
+                                        "res": s_res, "sup": s_sup,
+                                        "h1macd": round(h1_macd, 1)},
+                                  shadow=True)
+                    except Exception as e:
+                        print(f"{pair}: skipped-trade tracking error: {e}")
                 continue
 
         entry = m5[0]["c"]
@@ -974,13 +1174,17 @@ def scan():
         )
         send(msg)
         last_signal_time[pair] = now_ts
+        res_pts, sup_pts = sr_nearest(h1, h4, entry)
         add_trade(pair, "TREND", direction, entry, sl,
-                  [("TP1", tp1), ("TP2", tp2), ("TP3", tp3)])
+                  [("TP1", tp1), ("TP2", tp2), ("TP3", tp3)],
+                  meta={"cond": condition, "liq": "yes" if liq == "✅" else "no",
+                        "res": res_pts, "sup": sup_pts, "h1macd": round(h1_macd, 1)})
         print(f"{pair}: Signal sent: {direction} @ {entry:.4f}")
 
 # ── MAIN LOOP (started by sweep_bot.py) ───────────────────
 def run_kpojime(announce=True):
     print("Kpojime Bot starting...")
+    _load_trade_log()
     if announce:
         send(f"🚀 Kpojime Bot STARTED\n"
              f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
@@ -996,6 +1200,8 @@ def run_kpojime(announce=True):
             next_scan = time.time() + SCAN_INTERVAL
 
         if is_weekend():
+            for t in active_trades:
+                log_trade(t, "WEEKEND")
             active_trades.clear()
 
         if active_trades:
@@ -1092,7 +1298,7 @@ def build_heartbeat():
         f"Mode: {mode}\n"
         f"Last scan: {last}\n"
         f"Data API: {status['api']}\n"
-        f"Open trades tracked: {len(active_trades)}\n"
+        f"Open trades tracked: {len([t for t in active_trades if not t.get('shadow')])}\n"
         f"Twelve Data calls today: {calls_today()}"
     )
 
