@@ -137,6 +137,12 @@ TRACK_TOLERANCE = float(os.environ.get("TRACK_TOLERANCE", "1.5"))  # TP counts a
                                                                    # (broker and Twelve Data prices differ slightly)
 BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry as stop after TP1
 
+# ── TREND STACKING LIMIT ──────────────────────────────────
+# Max trend signals open at once in the same direction (applies to TREND only,
+# never to TIGHT or CHOP). A trade stays "open" until its final TP, SL or
+# breakeven alert, even after TP1. Set TREND_MAX_OPEN=0 on Render to turn it off.
+TREND_MAX_OPEN  = int(os.environ.get("TREND_MAX_OPEN", "1"))
+
 # ── PIPS ──────────────────────────────────────────────────
 # Price move that counts as 1 pip. Gold convention: 1 pip = 0.10 ($1 move = 10 pips).
 # If your broker counts 1 pip = 0.01, set PIP_SIZE=0.01 on Render.
@@ -509,7 +515,6 @@ def tight_box(m15):
     the newest TIGHT_WINDOW candles, but only when the M30 candles in that stretch
     are clearly smaller than the M30 candles before it (a squeeze).
     Returns {"high", "low", "mid", "width"} or None."""
-    need = TIGHT_WINDOW + 4 * TIGHT_BARS
     if not m15 or len(m15) < TIGHT_WINDOW + 2 * TIGHT_BARS:
         return None
     older = m15[TIGHT_WINDOW:]
@@ -917,6 +922,23 @@ def scan():
             print(f"{pair}: M5 not triggered"); continue
         if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
             print(f"{pair}: Cooldown"); continue
+
+        # ── TREND STACKING LIMIT (trend signals only) ─────
+        if TREND_MAX_OPEN > 0:
+            side = "SELL" if h4b == "BEARISH" else "BUY"
+            open_same = sum(1 for t in active_trades
+                            if t["kind"] == "TREND" and t["pair"] == pair
+                            and t["direction"] == side)
+            if open_same >= TREND_MAX_OPEN:
+                print(f"{pair}: {open_same} trend {side} already open — skip")
+                skip_key = f"{pair}_trend_skip_{side}"
+                if now_ts - last_signal_time.get(skip_key, 0) >= signal_cooldown:
+                    send(f"⏭ TREND {side} skipped — {pair}\n"
+                         f"A trend {side} is still open, so no new one was sent.\n"
+                         f"Would-be entry: {m5[0]['c']:.4f}\n"
+                         f"Time: {now_str}")
+                    last_signal_time[skip_key] = now_ts
+                continue
 
         entry = m5[0]["c"]
         sl, tp1, tp2, tp3 = levels(entry, h4b, h1_wick if h1_wick else entry)
