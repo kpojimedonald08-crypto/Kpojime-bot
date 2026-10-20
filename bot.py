@@ -7,6 +7,7 @@ KPOJIME BOT - one Render service.
             TIGHT BREAKOUT  = break holds, M5 retest rejects the edge
             TIGHT FAKE-OUT  = break fails, price closes back inside the box
           + trade tracker (TP / SL alerts)
+          + early warning alerts (WATCH / READY) and VALID UNTIL messages
   Part 3  launcher: web server, self-ping, the bot, and an independent
           heartbeat that keeps running while the bot sleeps or the API is down.
           If the bot crashes it is restarted automatically.
@@ -675,6 +676,12 @@ def add_trade(pair, kind, direction, entry, sl, tps, meta=None, shadow=False):
         "meta": meta or {}, "shadow": shadow,
     })
     print(f"{pair}: tracking {kind} {direction} @ {entry:.4f}")
+    active_trades[-1]["h4"] = status.get("h4b", "")
+    if EARLY_ALERTS and not shadow:
+        try:
+            send_valid_until(pair, kind, direction, entry, sl)
+        except Exception as e:
+            print(f"valid-until error: {e}")
 
 def _r_mult(trade, price):
     return abs(price - trade["entry"]) / trade["risk"] if trade["risk"] > 0 else 0
@@ -691,7 +698,7 @@ def _stopped(trade, c, level):
 LOG_FIELDS = ["opened_utc", "closed_utc", "pair", "kind", "direction", "entry", "sl",
               "risk_pips", "outcome", "tps_hit", "r_hold", "r_tp1", "pips_hold",
               "pips_tp1", "condition", "box_or_range", "liq_grab", "res_pts",
-              "sup_pts", "h1_macd"]
+              "sup_pts", "h1_macd", "h4_bias", "mae_pts", "mfe_pts"]
 trade_log = []        # closed trades (dicts), oldest first
 log_cursor = 0        # trades before this index were already in a daily summary
 _log_loaded = False
@@ -761,6 +768,9 @@ def log_trade(t, outcome):
             "condition": m.get("cond", ""), "box_or_range": m.get("size", ""),
             "liq_grab": m.get("liq", ""), "res_pts": m.get("res", ""),
             "sup_pts": m.get("sup", ""), "h1_macd": m.get("h1macd", ""),
+            "h4_bias": t.get("h4", ""),
+            "mae_pts": round(t.get("mae", 0.0), 1),
+            "mfe_pts": round(t.get("mfe", 0.0), 1),
         }
         trade_log.append(row)
         new_file = not os.path.exists(TRADE_LOG_PATH)
@@ -839,6 +849,7 @@ def process_candle(t, c):
     """Returns True when the trade is finished."""
     say  = (lambda m: None) if t.get("shadow") else send
     head = f"{t['pair']} {t['direction']} ({t['kind']})"
+    _update_excursion(t, c)
     be   = BE_AFTER_TP1 and t["hit"] >= 1
     stop = t["entry"] if be else t["sl"]
 
@@ -917,6 +928,214 @@ def track_trades():
             else:
                 t["base_t"] = newest_t
 
+# ======================================================================
+# EARLY WARNING (WATCH / READY), VALID-UNTIL, EXTRA LOG DATA
+# Read-only add-on. Nothing in here decides whether a trade is taken.
+# Set EARLY_ALERTS=0 on Render to switch the new Telegram messages off.
+# ======================================================================
+EARLY_ALERTS    = os.environ.get("EARLY_ALERTS", "1") == "1"
+EARLY_TIGHT     = os.environ.get("EARLY_TIGHT", "1") == "1"      # 0 = no WATCH/READY for tight boxes
+WATCH_COOLDOWN  = float(os.environ.get("WATCH_COOLDOWN", "1800"))  # seconds between WATCH alerts (same setup)
+READY_COOLDOWN  = float(os.environ.get("READY_COOLDOWN", "900"))   # seconds between READY alerts (same setup)
+BOS_TOLERANCE   = 15.0   # same number the trend scan uses for "price at BOS level"
+VALID_FRAC      = float(os.environ.get("VALID_FRAC", "0.3"))     # entry stale after this share of 1R is gone
+VALID_MINUTES   = int(os.environ.get("VALID_MINUTES", "30"))     # ...or after this many minutes
+H4_CACHE_MIN    = float(os.environ.get("H4_CACHE_MIN", "0"))     # 0 = off (fetch H4 every scan, as before)
+
+early_sent = {}
+
+
+def _early_ok(key, cooldown):
+    now = time.time()
+    if now - early_sent.get(key, 0) < cooldown:
+        return False
+    early_sent[key] = now
+    return True
+
+
+_h4_cache = {}
+
+
+def fetch_h4(pair):
+    """Same as fetch(pair, '4h', 30). With H4_CACHE_MIN > 0 it reuses the last
+    H4 candles for that many minutes, saving Twelve Data credits."""
+    ttl = H4_CACHE_MIN * 60
+    if ttl > 0:
+        hit = _h4_cache.get(pair)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+    data = fetch(pair, "4h", 30)
+    if data and ttl > 0:
+        _h4_cache[pair] = (time.time(), data)
+    return data
+
+
+def _update_excursion(t, c):
+    """Tracks how far price went against (mae) and for (mfe) the trade, in points."""
+    try:
+        if t["direction"] == "BUY":
+            adverse, favour = t["entry"] - c["l"], c["h"] - t["entry"]
+        else:
+            adverse, favour = c["h"] - t["entry"], t["entry"] - c["l"]
+        t["mae"] = max(t.get("mae", 0.0), adverse)
+        t["mfe"] = max(t.get("mfe", 0.0), favour)
+    except Exception:
+        pass
+
+
+def send_valid_until(pair, kind, direction, entry, sl):
+    """Short follow-up message right after a signal: when the entry goes stale."""
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return
+    if direction == "SELL":
+        lim = entry - VALID_FRAC * risk
+        rule = f"price is still ABOVE {lim:.2f}"
+    else:
+        lim = entry + VALID_FRAC * risk
+        rule = f"price is still BELOW {lim:.2f}"
+    until = (_utcnow() + timedelta(minutes=VALID_MINUTES)).strftime("%H:%M")
+    send(f"⏱ VALID UNTIL — {pair} {direction} ({kind})\n"
+         f"Enter only while {rule}, and before {until} UTC.\n"
+         f"Past that, too much of the move is gone: skip it.")
+
+
+def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
+    """WATCH / READY for the trend signal. Mirrors the trend conditions but only reads."""
+    if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
+        return
+    h4b = bias(h4)
+    if h4b == "NEUTRAL":
+        h4b = bias(m15)
+    if h4b == "NEUTRAL" or h4b != bias(h1):
+        return
+    h1_macd = macd_value(h1)
+    if h4b == "BEARISH" and h1_macd > -5:
+        return
+    if h4b == "BULLISH" and h1_macd < 5:
+        return
+    if not macd_aligned(h1, h4b):
+        return
+    h1_bos, h1_wick, _ = bos(h1, h4b)
+    if not h1_bos:
+        return
+    side = "SELL" if h4b == "BEARISH" else "BUY"
+    if TREND_MAX_OPEN > 0:
+        open_same = sum(1 for t in active_trades
+                        if t["kind"] == "TREND" and t["pair"] == pair
+                        and t["direction"] == side and not t.get("shadow"))
+        if open_same >= TREND_MAX_OPEN:
+            return
+
+    price    = m5[0]["c"]
+    gap      = abs(price - h1_wick)
+    at_level = gap <= BOS_TOLERANCE
+    m15_ok   = bias(m15) == h4b
+    trig     = m5_trigger(m5, h4b)
+    if at_level and m15_ok and trig:
+        return                      # every condition met: the real signal fires now
+
+    if h4b == "BEARISH":
+        trig_level = min(c["l"] for c in m5[2:7])
+        trig_text  = f"an M5 candle closes BELOW {trig_level:.2f}"
+    else:
+        trig_level = max(c["h"] for c in m5[2:7])
+        trig_text  = f"an M5 candle closes ABOVE {trig_level:.2f}"
+
+    if at_level and m15_ok:         # only the M5 trigger is missing
+        if _early_ok((pair, "READY", side), READY_COOLDOWN):
+            send(f"🟠 READY — {side} (trend) — {pair}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"Everything lines up except the M5 trigger.\n"
+                 f"Price     : {price:.2f}\n"
+                 f"BOS level : {h1_wick:.2f}\n"
+                 f"Fires when: {trig_text}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"Get your chart ready. Not an entry yet: wait for the SIGNAL ALERT.\n"
+                 f"Time: {now_str}")
+        return
+
+    if not at_level:
+        why = (f"Price is {gap:.1f} pts from the BOS level ({h1_wick:.2f}). "
+               f"Waiting for it to come back within {BOS_TOLERANCE:g} pts.")
+    else:
+        why = "Price is at the BOS level. Waiting for M15 to line up."
+    if _early_ok((pair, "WATCH", side), WATCH_COOLDOWN):
+        send(f"👀 WATCH — {side} (trend) setup forming — {pair}\n"
+             f"━━━━━━━━━━━━━━━━\n"
+             f"H4/H1 bias {h4b}, H1 break of structure is in.\n"
+             f"{why}\n"
+             f"Price: {price:.2f}\n"
+             f"━━━━━━━━━━━━━━━━\n"
+             f"Not an entry. A READY alert comes when one step is left.\n"
+             f"Time: {now_str}")
+
+
+def _early_tight(pair, h1, m15, m5, now_ts, now_str):
+    """WATCH (box formed) and READY (break closed, waiting for M5 retest) for TIGHT."""
+    if not (TIGHT_ENABLED and EARLY_TIGHT) or not m5 or len(m5) < 3:
+        return
+    box = tight_box(m15)
+    if not box:
+        return
+    if tight_signals(m15, m5, macd_value(h1)):
+        return                      # a real tight signal is firing or on cooldown
+    hi, lo = box["high"], box["low"]
+    tag = f"{hi:.1f}-{lo:.1f}"
+    win = m15[:TIGHT_WINDOW]
+    brk = None
+    for i in range(len(win) - 1, -1, -1):
+        if win[i]["c"] > hi:
+            brk = ("UP", i)
+            break
+        if win[i]["c"] < lo:
+            brk = ("DOWN", i)
+            break
+
+    if not brk:
+        if _early_ok((pair, "TIGHT WATCH", tag), TIGHT_COOLDOWN):
+            send(f"👀 WATCH — TIGHT box formed — {pair}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"Box : {lo:.2f} — {hi:.2f}  ({box['width']:.1f} pts)\n"
+                 f"Price: {m5[0]['c']:.2f}\n"
+                 f"A breakout above {hi:.2f} or below {lo:.2f} can follow.\n"
+                 f"Not an entry.\nTime: {now_str}")
+        return
+
+    side, i = brk
+    up = side == "UP"
+    held = all((c["c"] > hi) if up else (c["c"] < lo) for c in win[:i + 1])
+    if not held or not TIGHT_BREAKOUT:
+        return                      # failed break: the fake-out logic handles it
+    edge = hi if up else lo
+    if _early_ok((pair, "TIGHT READY", tag, side), TIGHT_COOLDOWN):
+        send(f"🟠 READY — TIGHT BREAKOUT {'BUY' if up else 'SELL'} — {pair}\n"
+             f"━━━━━━━━━━━━━━━━\n"
+             f"M15 closed {'above' if up else 'below'} the box ({lo:.2f} — {hi:.2f}).\n"
+             f"Price: {m5[0]['c']:.2f}\n"
+             f"Fires when M5 retests within {TIGHT_RETEST_TOL:g} pts of {edge:.2f} "
+             f"and closes {'bullish' if up else 'bearish'}.\n"
+             f"Not an entry yet: wait for the SIGNAL ALERT.\nTime: {now_str}")
+
+
+def early_alerts(pair, h4, h1, m15, m5, now_ts, now_str):
+    """Called once per scan. Never raises and never changes any signal."""
+    try:
+        status["h4b"] = bias(h4)    # saved into the trade log
+    except Exception:
+        pass
+    if not EARLY_ALERTS:
+        return
+    try:
+        _early_trend(pair, h4, h1, m15, m5, now_ts, now_str)
+    except Exception as e:
+        print(f"{pair}: early trend alert error: {e}")
+    try:
+        _early_tight(pair, h1, m15, m5, now_ts, now_str)
+    except Exception as e:
+        print(f"{pair}: early tight alert error: {e}")
+
+
 # ── SCAN ──────────────────────────────────────────────────
 last_signal_time = {}
 last_heartbeat    = 0
@@ -949,7 +1168,7 @@ def scan():
 
     for pair in PAIRS:
         print(f"Scanning {pair} at {now_str}")
-        h4  = fetch(pair, "4h",    30)
+        h4  = fetch_h4(pair)
         h1  = fetch(pair, "1h",    30)
         m15 = fetch(pair, "15min", 30)
         m5  = fetch(pair, "5min",  30)
@@ -1000,6 +1219,9 @@ def scan():
                 )
             send(hb_msg)
             last_heartbeat = now_ts
+
+        # ── EARLY WARNING (read-only, never blocks a signal) ──
+        early_alerts(pair, h4, h1, m15, m5, now_ts, now_str)
 
         # ── TIGHT-MARKET SIGNALS (separate from trend + chop) ──
         # Runs before the chop block and never skips the rest of the scan,
