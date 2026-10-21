@@ -8,6 +8,7 @@ KPOJIME BOT - one Render service.
             TIGHT FAKE-OUT  = break fails, price closes back inside the box
           + trade tracker (TP / SL alerts)
           + early warning alerts (WATCH / READY) and VALID UNTIL messages
+          + silent test signals (TEST H1-RETEST, TEST LTF-RETEST): log only
   Part 3  launcher: web server, self-ping, the bot, and an independent
           heartbeat that keeps running while the bot sleeps or the API is down.
           If the bot crashes it is restarted automatically.
@@ -746,7 +747,12 @@ def log_trade(t, outcome):
         elif outcome == "TP_FINAL":
             r_hold = _r_of(t, t["tps"][-1][1])
         else:
+            # TIMEOUT / WEEKEND: mark to market at the last price seen
             r_hold = None
+            px = t.get("last_px")
+            if px is not None and t["risk"] > 0:
+                move = (px - t["entry"]) if t["direction"] == "BUY" else (t["entry"] - px)
+                r_hold = max(-1.0, move / t["risk"])
         if hit >= 1:
             r_tp1 = r1
         elif outcome == "SL":
@@ -757,7 +763,7 @@ def log_trade(t, outcome):
             "opened_utc": t.get("opened", ""),
             "closed_utc": _utcnow().strftime("%Y-%m-%d %H:%M"),
             "pair": t["pair"],
-            "kind": t["kind"] + (" (SKIPPED)" if t.get("shadow") else ""),
+            "kind": t["kind"] + (" (SKIPPED)" if t.get("shadow") and not t.get("test") else ""),
             "direction": t["direction"],
             "entry": round(t["entry"], 2), "sl": round(t["sl"], 2),
             "risk_pips": risk_pips, "outcome": outcome, "tps_hit": hit,
@@ -940,7 +946,7 @@ READY_COOLDOWN  = float(os.environ.get("READY_COOLDOWN", "900"))   # seconds bet
 BOS_TOLERANCE   = 15.0   # same number the trend scan uses for "price at BOS level"
 VALID_FRAC      = float(os.environ.get("VALID_FRAC", "0.3"))     # entry stale after this share of 1R is gone
 VALID_MINUTES   = int(os.environ.get("VALID_MINUTES", "30"))     # ...or after this many minutes
-H4_CACHE_MIN    = float(os.environ.get("H4_CACHE_MIN", "0"))     # 0 = off (fetch H4 every scan, as before)
+H4_CACHE_MIN    = float(os.environ.get("H4_CACHE_MIN", "30"))    # reuse H4 candles this many minutes (saves ~140 credits/day); 0 = fetch every scan
 
 early_sent = {}
 
@@ -979,6 +985,7 @@ def _update_excursion(t, c):
             adverse, favour = c["h"] - t["entry"], t["entry"] - c["l"]
         t["mae"] = max(t.get("mae", 0.0), adverse)
         t["mfe"] = max(t.get("mfe", 0.0), favour)
+        t["last_px"] = c["c"]
     except Exception:
         pass
 
@@ -1136,6 +1143,244 @@ def early_alerts(pair, h4, h1, m15, m5, now_ts, now_str):
         print(f"{pair}: early tight alert error: {e}")
 
 
+# ======================================================================
+# SILENT TEST SIGNALS (log only: nothing is ever sent to Telegram)
+#   TEST H1-RETEST  = H1 candle CLOSES beyond structure, then M5 retests the
+#                     broken level and rejects it (your BOS retest, done properly)
+#   TEST LTF-RETEST = M15 candle closes beyond structure, M5 retests the broken
+#                     level, M1 gives the trigger (M15 / M5 / M1)
+# They are tracked like the "(SKIPPED)" trades and appear in the daily log and
+# CSV under their own names, so you can compare them with TREND and TIGHT.
+# TEST_ENABLED=0 on Render switches both off.
+# ======================================================================
+TEST_ENABLED    = os.environ.get("TEST_ENABLED", "1") == "1"
+H1RT_ENABLED    = os.environ.get("H1RT_ENABLED", "1") == "1"
+LTF_ENABLED     = os.environ.get("LTF_ENABLED", "1") == "1"
+TEST_MAX_OPEN   = int(os.environ.get("TEST_MAX_OPEN", "3"))        # open test trades at once
+TEST_CREDIT_CAP = int(os.environ.get("TEST_CREDIT_CAP", "700"))    # no NEW test trades above this many Twelve Data calls today
+TEST_HARD_CAP   = int(os.environ.get("TEST_HARD_CAP", "750"))      # above this, open test trades are closed to protect live tracking
+
+H1RT_TOL        = float(os.environ.get("H1RT_TOL", "4"))           # M5 must come back within this many pts of the broken level
+H1RT_OVER       = float(os.environ.get("H1RT_OVER", "8"))          # ...but not push more than this beyond it (break failed)
+H1RT_BUFFER     = float(os.environ.get("H1RT_BUFFER", "3"))        # stop sits this far beyond the retest extreme
+H1RT_MIN_RISK   = float(os.environ.get("H1RT_MIN_RISK", "4"))
+H1RT_MAX_RISK   = float(os.environ.get("H1RT_MAX_RISK", "30"))
+H1RT_COOLDOWN   = float(os.environ.get("H1RT_COOLDOWN", "3600"))
+H1RT_MAX_HOURS  = float(os.environ.get("H1RT_MAX_HOURS", "3"))
+
+LTF_MIN_MACD    = float(os.environ.get("LTF_MIN_MACD", "1.0"))     # |M15 MACD| needed to pick a direction
+LTF_TOL         = float(os.environ.get("LTF_TOL", "2"))
+LTF_OVER        = float(os.environ.get("LTF_OVER", "5"))
+LTF_BUFFER      = float(os.environ.get("LTF_BUFFER", "2"))
+LTF_MIN_RISK    = float(os.environ.get("LTF_MIN_RISK", "3"))
+LTF_MAX_RISK    = float(os.environ.get("LTF_MAX_RISK", "12"))
+LTF_COOLDOWN    = float(os.environ.get("LTF_COOLDOWN", "900"))
+LTF_MAX_HOURS   = float(os.environ.get("LTF_MAX_HOURS", "1.5"))
+
+test_last = {}
+
+
+def _dt(s):
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _closed_break(candles, direction, max_age):
+    """Most recent CLOSED candle (index 1..max_age; index 0 is still forming)
+    whose close is beyond the extreme of the 5 candles before it, and which no
+    later closed candle has closed back through. Returns (index, level) or None."""
+    for k in range(1, max_age + 1):
+        base = candles[k + 1:k + 6]
+        if len(base) < 5:
+            return None
+        if direction == "BEARISH":
+            lvl = min(c["l"] for c in base)
+            if candles[k]["c"] < lvl and all(c["c"] < lvl for c in candles[1:k]):
+                return k, lvl
+        else:
+            lvl = max(c["h"] for c in base)
+            if candles[k]["c"] > lvl and all(c["c"] > lvl for c in candles[1:k]):
+                return k, lvl
+    return None
+
+
+def _retest(m5, direction, lvl, cutoff, tol, over):
+    """Looks at the M5 candles after the break. Returns the retest candle (the one
+    that reached back to the broken level) or None. The last closed M5 candle must
+    have rejected the level (closed back on the break side, in the break direction)."""
+    post = [c for c in m5 if (_dt(c["t"]) or cutoff) >= cutoff]
+    if len(post) < 2 or len(m5) < 2:
+        return None
+    last = m5[1]
+    if (_dt(last["t"]) or cutoff) < cutoff:
+        return None
+    if direction == "BEARISH":
+        probe = max(post, key=lambda c: c["h"])
+        if not (lvl - tol <= probe["h"] <= lvl + over):
+            return None
+        if not (last["c"] < lvl and last["c"] < last["o"]):
+            return None
+    else:
+        probe = min(post, key=lambda c: c["l"])
+        if not (lvl - over <= probe["l"] <= lvl + tol):
+            return None
+        if not (last["c"] > lvl and last["c"] > last["o"]):
+            return None
+    return probe
+
+
+def h1_retest_signal(h4, h1, m15, m5):
+    """TEST H1-RETEST. Same direction rules as the trend signal, but the H1 break
+    must be a CLOSED candle and entry waits for the M5 retest + rejection."""
+    h4b = bias(h4)
+    if h4b == "NEUTRAL":
+        h4b = bias(m15)
+    if h4b == "NEUTRAL" or h4b != bias(h1):
+        return None
+    h1m = macd_value(h1)
+    if h4b == "BEARISH" and h1m > -5:
+        return None
+    if h4b == "BULLISH" and h1m < 5:
+        return None
+    brk = _closed_break(h1, h4b, 3)
+    if not brk:
+        return None
+    k, lvl = brk
+    t_break = _dt(h1[k]["t"])
+    if t_break is None:
+        return None
+    probe = _retest(m5, h4b, lvl, t_break + timedelta(hours=1), H1RT_TOL, H1RT_OVER)
+    if not probe:
+        return None
+    entry = m5[0]["c"]
+    if h4b == "BEARISH":
+        sl, side = probe["h"] + H1RT_BUFFER, "SELL"
+        risk = sl - entry
+    else:
+        sl, side = probe["l"] - H1RT_BUFFER, "BUY"
+        risk = entry - sl
+    if not (H1RT_MIN_RISK <= risk <= H1RT_MAX_RISK):
+        return None
+    return {"side": side, "dir": h4b, "entry": entry, "sl": sl, "risk": risk,
+            "level": lvl, "h1macd": h1m}
+
+
+def ltf_retest_signal(m15, m5, get_m1):
+    """TEST LTF-RETEST. M15 closed break, M5 retest + rejection, M1 trigger.
+    get_m1() costs 1 Twelve Data credit and is only called when M15 and M5 already agree."""
+    mv = macd_value(m15)
+    if abs(mv) < LTF_MIN_MACD:
+        return None
+    direction = "BEARISH" if mv < 0 else "BULLISH"
+    brk = _closed_break(m15, direction, 4)
+    if not brk:
+        return None
+    k, lvl = brk
+    t_break = _dt(m15[k]["t"])
+    if t_break is None:
+        return None
+    cutoff = t_break + timedelta(minutes=15)
+    probe = _retest(m5, direction, lvl, cutoff, LTF_TOL, LTF_OVER)
+    if not probe:
+        return None
+    t_probe = _dt(probe["t"])
+    m1 = get_m1()
+    if not m1 or len(m1) < 8 or t_probe is None:
+        return None
+    trig = None
+    for j in range(1, 4):                         # last 3 CLOSED M1 candles
+        base = m1[j + 1:j + 4]
+        c = m1[j]
+        ct = _dt(c["t"])
+        if len(base) < 3 or ct is None or ct < t_probe:
+            continue
+        if direction == "BEARISH":
+            if c["c"] < min(x["l"] for x in base) and c["c"] < lvl and c["c"] < c["o"]:
+                trig = c
+                break
+        else:
+            if c["c"] > max(x["h"] for x in base) and c["c"] > lvl and c["c"] > c["o"]:
+                trig = c
+                break
+    if not trig:
+        return None
+    entry = trig["c"]
+    if direction == "BEARISH":
+        sl, side = probe["h"] + LTF_BUFFER, "SELL"
+        risk = sl - entry
+    else:
+        sl, side = probe["l"] - LTF_BUFFER, "BUY"
+        risk = entry - sl
+    if not (LTF_MIN_RISK <= risk <= LTF_MAX_RISK):
+        return None
+    nxt = (_dt(trig["t"]) + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    return {"side": side, "dir": direction, "entry": entry, "sl": sl, "risk": risk,
+            "level": lvl, "h1macd": None, "base_t": nxt}
+
+
+def _open_test(pair, kind, sig, max_hours, meta):
+    sign = 1 if sig["side"] == "BUY" else -1
+    tps = [("TP1", sig["entry"] + sign * sig["risk"]),
+           ("TP2", sig["entry"] + sign * sig["risk"] * 2),
+           ("TP3", sig["entry"] + sign * sig["risk"] * 3)]
+    add_trade(pair, kind, sig["side"], sig["entry"], sig["sl"], tps, meta=meta, shadow=True)
+    t = active_trades[-1]
+    t["test"] = True
+    if sig.get("base_t"):
+        t["base_t"] = sig["base_t"]               # replay from the M1 candle after the trigger
+    # shorter lifetime than live trades: pretend it was created earlier
+    t["created"] = time.time() - max(0.0, TRACK_MAX_HOURS - max_hours) * 3600
+
+
+def _drop_tests():
+    for t in active_trades[:]:
+        if t.get("test"):
+            log_trade(t, "TIMEOUT")
+            active_trades.remove(t)
+
+
+def test_signals(pair, h4, h1, m15, m5, condition, now_ts):
+    """Called once per scan. Silent. Never changes a live signal."""
+    if not TEST_ENABLED:
+        return
+    used = calls_today()
+    if used >= TEST_HARD_CAP:
+        _drop_tests()
+        return
+    if used >= TEST_CREDIT_CAP:
+        return
+    if sum(1 for t in active_trades if t.get("test")) >= TEST_MAX_OPEN:
+        return
+
+    def taken(kind, side, cooldown):
+        key = (pair, kind, side)
+        if now_ts - test_last.get(key, 0) < cooldown:
+            return True
+        return any(t["kind"] == kind and t["direction"] == side for t in active_trades)
+
+    if H1RT_ENABLED:
+        sig = h1_retest_signal(h4, h1, m15, m5)
+        if sig and not taken("TEST H1-RETEST", sig["side"], H1RT_COOLDOWN):
+            res, sup = sr_nearest(h1, h4, sig["entry"])
+            _open_test(pair, "TEST H1-RETEST", sig, H1RT_MAX_HOURS,
+                       {"cond": condition, "liq": "yes" if liquidity_grab(m15, sig["dir"]) else "no",
+                        "res": res, "sup": sup, "h1macd": round(sig["h1macd"], 1)})
+            test_last[(pair, "TEST H1-RETEST", sig["side"])] = now_ts
+            print(f"{pair}: TEST H1-RETEST {sig['side']} @ {sig['entry']:.2f} (silent)")
+
+    if LTF_ENABLED and sum(1 for t in active_trades if t.get("test")) < TEST_MAX_OPEN:
+        sig = ltf_retest_signal(m15, m5, lambda: fetch(pair, "1min", 30))
+        if sig and not taken("TEST LTF-RETEST", sig["side"], LTF_COOLDOWN):
+            res, sup = sr_nearest(h1, h4, sig["entry"])
+            _open_test(pair, "TEST LTF-RETEST", sig, LTF_MAX_HOURS,
+                       {"cond": condition, "liq": "yes" if liquidity_grab(m15, sig["dir"]) else "no",
+                        "res": res, "sup": sup, "h1macd": round(macd_value(h1), 1)})
+            test_last[(pair, "TEST LTF-RETEST", sig["side"])] = now_ts
+            print(f"{pair}: TEST LTF-RETEST {sig['side']} @ {sig['entry']:.2f} (silent)")
+
+
 # ── SCAN ──────────────────────────────────────────────────
 last_signal_time = {}
 last_heartbeat    = 0
@@ -1222,6 +1467,12 @@ def scan():
 
         # ── EARLY WARNING (read-only, never blocks a signal) ──
         early_alerts(pair, h4, h1, m15, m5, now_ts, now_str)
+
+        # ── SILENT TEST SIGNALS (log only, never sent, never block anything) ──
+        try:
+            test_signals(pair, h4, h1, m15, m5, condition, now_ts)
+        except Exception as e:
+            print(f"{pair}: test signal error: {e}")
 
         # ── TIGHT-MARKET SIGNALS (separate from trend + chop) ──
         # Runs before the chop block and never skips the rest of the scan,
