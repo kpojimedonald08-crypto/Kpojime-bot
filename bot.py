@@ -9,6 +9,7 @@ KPOJIME BOT - one Render service.
           + trade tracker (TP / SL alerts)
           + early warning alerts (WATCH / READY) and VALID UNTIL messages
           + silent test signals (TEST H1-RETEST, TEST LTF-RETEST): log only
+          + OPPOSITE-DIRECTION BLOCK: no live signal against an open live trade
   Part 3  launcher: web server, self-ping, the bot, and an independent
           heartbeat that keeps running while the bot sleeps or the API is down.
           If the bot crashes it is restarted automatically.
@@ -145,6 +146,15 @@ BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry 
 # never to TIGHT or CHOP). A trade stays "open" until its final TP, SL or
 # breakeven alert, even after TP1. Set TREND_MAX_OPEN=0 on Render to turn it off.
 TREND_MAX_OPEN  = int(os.environ.get("TREND_MAX_OPEN", "1"))
+
+# ── OPPOSITE-DIRECTION BLOCK ──────────────────────────────
+# While a LIVE trade (trend, chop, tight) is open on a pair, no new live signal
+# in the OPPOSITE direction is sent. Same-direction signals still go out.
+# The blocked signal is not sent to Telegram; it is tracked silently and shows in
+# the trade log as "<KIND> (BLOCKED)" so you can check later whether the block
+# helped. Silent TEST signals are not affected. A trade counts as open until its
+# final TP, SL, breakeven or time stop. Set OPPOSITE_BLOCK=0 on Render to turn off.
+OPPOSITE_BLOCK  = os.environ.get("OPPOSITE_BLOCK", "1") == "1"
 
 # ── TRADE LOG ─────────────────────────────────────────────
 # Every closed trade is written to a CSV and summarised on Telegram when the bot
@@ -684,6 +694,24 @@ def add_trade(pair, kind, direction, entry, sl, tps, meta=None, shadow=False):
         except Exception as e:
             print(f"valid-until error: {e}")
 
+def opposite_open(pair, direction):
+    """True when a LIVE trade (not a silent/test/blocked one) is open on this pair
+    in the opposite direction. direction is "BUY" or "SELL"."""
+    if not OPPOSITE_BLOCK:
+        return False
+    return any(t["pair"] == pair and t["direction"] != direction and not t.get("shadow")
+               for t in active_trades)
+
+def log_blocked(pair, kind, direction, entry, sl, tps, meta=None):
+    """Tracks a blocked opposite-direction signal silently so the trade log can
+    show how it would have ended. Never raises."""
+    try:
+        add_trade(pair, kind, direction, entry, sl, tps, meta=meta, shadow=True)
+        active_trades[-1]["blocked"] = True
+        print(f"{pair}: {kind} {direction} blocked (opposite trade open), tracked silently")
+    except Exception as e:
+        print(f"{pair}: blocked-trade tracking error: {e}")
+
 def _r_mult(trade, price):
     return abs(price - trade["entry"]) / trade["risk"] if trade["risk"] > 0 else 0
 
@@ -759,11 +787,15 @@ def log_trade(t, outcome):
             r_tp1 = -1.0
         else:
             r_tp1 = None
+        if t.get("shadow") and not t.get("test"):
+            kind_label = t["kind"] + (" (BLOCKED)" if t.get("blocked") else " (SKIPPED)")
+        else:
+            kind_label = t["kind"]
         row = {
             "opened_utc": t.get("opened", ""),
             "closed_utc": _utcnow().strftime("%Y-%m-%d %H:%M"),
             "pair": t["pair"],
-            "kind": t["kind"] + (" (SKIPPED)" if t.get("shadow") and not t.get("test") else ""),
+            "kind": kind_label,
             "direction": t["direction"],
             "entry": round(t["entry"], 2), "sl": round(t["sl"], 2),
             "risk_pips": risk_pips, "outcome": outcome, "tps_hit": hit,
@@ -871,7 +903,7 @@ def process_candle(t, c):
             say(f"❌ STOP LOSS HIT — {head}\n"
                 f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
             log_trade(t, "SL")
-            if t["kind"] == "CHOP":
+            if t["kind"] == "CHOP" and not t.get("shadow"):
                 chop_state["losses"] += 1
                 if chop_state["losses"] >= CHOP_MAX_LOSSES:
                     chop_state["paused_until"] = time.time() + CHOP_PAUSE_HOURS * 3600
@@ -886,7 +918,7 @@ def process_candle(t, c):
         if not _reached(t, c, price):
             break
         t["hit"] += 1
-        if t["kind"] == "CHOP":
+        if t["kind"] == "CHOP" and not t.get("shadow"):
             chop_state["losses"] = 0      # a win resets the loss streak
         final = t["hit"] == len(t["tps"])
         if final:
@@ -1027,6 +1059,8 @@ def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
     if not h1_bos:
         return
     side = "SELL" if h4b == "BEARISH" else "BUY"
+    if opposite_open(pair, side):
+        return                      # an opposite live trade is open: no alerts for this side
     if TREND_MAX_OPEN > 0:
         open_same = sum(1 for t in active_trades
                         if t["kind"] == "TREND" and t["pair"] == pair
@@ -1114,6 +1148,8 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
     held = all((c["c"] > hi) if up else (c["c"] < lo) for c in win[:i + 1])
     if not held or not TIGHT_BREAKOUT:
         return                      # failed break: the fake-out logic handles it
+    if opposite_open(pair, "BUY" if up else "SELL"):
+        return                      # an opposite live trade is open: this signal would be blocked
     edge = hi if up else lo
     if _early_ok((pair, "TIGHT READY", tag, side), TIGHT_COOLDOWN):
         send(f"🟠 READY — TIGHT BREAKOUT {'BUY' if up else 'SELL'} — {pair}\n"
@@ -1490,6 +1526,15 @@ def scan():
                     if is_break and now_ts - last_signal_time.get(fake_key, 0) < TIGHT_COOLDOWN:
                         continue
                     b = sig["box"]
+                    # ── OPPOSITE-DIRECTION BLOCK ──
+                    if opposite_open(pair, sig["direction"]):
+                        blk_key = key + "_blocked"
+                        if now_ts - last_signal_time.get(blk_key, 0) >= TIGHT_COOLDOWN:
+                            last_signal_time[blk_key] = now_ts
+                            log_blocked(pair, sig["kind"], sig["direction"], sig["entry"],
+                                        sig["sl"], sig["tps"],
+                                        meta={"cond": condition, "size": round(b["width"], 1)})
+                        continue
                     emoji = "🔴" if sig["direction"] == "SELL" else "🟢"
                     tp_lines = "".join(
                         f"{name:<10}: {price:.4f}  ({pips(sig['entry'], price)} pips)\n"
@@ -1523,6 +1568,16 @@ def scan():
         if CHOP_ENABLED and condition == "CHOPPY" and now_ts >= chop_state["paused_until"]:
             chop = chop_signal(m15, m5, macd_value(h1))
             chop_key = f"{pair}_chop"
+            # ── OPPOSITE-DIRECTION BLOCK ──
+            if chop and opposite_open(pair, chop["direction"]):
+                blk_key = chop_key + "_blocked"
+                if now_ts - last_signal_time.get(blk_key, 0) >= signal_cooldown:
+                    last_signal_time[blk_key] = now_ts
+                    log_blocked(pair, "CHOP", chop["direction"], chop["entry"], chop["sl"],
+                                [("TP1", chop["tp1"]), ("TP2", chop["tp2"])],
+                                meta={"cond": condition,
+                                      "size": round(chop["r_high"] - chop["r_low"], 1)})
+                chop = None
             if chop and now_ts - last_signal_time.get(chop_key, 0) >= signal_cooldown:
                 emoji = "🔴" if chop["direction"] == "SELL" else "🟢"
                 msg = (
@@ -1612,6 +1667,26 @@ def scan():
                     except Exception as e:
                         print(f"{pair}: skipped-trade tracking error: {e}")
                 continue
+
+        # ── OPPOSITE-DIRECTION BLOCK (trend) ──────────────
+        trend_side = "SELL" if h4b == "BEARISH" else "BUY"
+        if opposite_open(pair, trend_side):
+            blk_key = f"{pair}_trend_blocked_{trend_side}"
+            if now_ts - last_signal_time.get(blk_key, 0) >= signal_cooldown:
+                last_signal_time[blk_key] = now_ts
+                try:
+                    b_entry = m5[0]["c"]
+                    b_sl, b_tp1, b_tp2, b_tp3 = levels(b_entry, h4b, h1_wick if h1_wick else b_entry)
+                    b_res, b_sup = sr_nearest(h1, h4, b_entry)
+                    log_blocked(pair, "TREND", trend_side, b_entry, b_sl,
+                                [("TP1", b_tp1), ("TP2", b_tp2), ("TP3", b_tp3)],
+                                meta={"cond": condition,
+                                      "liq": "yes" if liquidity_grab(m15, h4b) else "no",
+                                      "res": b_res, "sup": b_sup,
+                                      "h1macd": round(h1_macd, 1)})
+                except Exception as e:
+                    print(f"{pair}: blocked trend tracking error: {e}")
+            continue
 
         entry = m5[0]["c"]
         sl, tp1, tp2, tp3 = levels(entry, h4b, h1_wick if h1_wick else entry)
