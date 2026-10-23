@@ -1,15 +1,22 @@
 """
 KPOJIME BOT - one Render service. Two live signals only:
 
-  1. BOS TREND      H4 bias + H1 BOS + M15 confirm + M5 trigger (exactly as it was)
+  1. BOS TREND      H4 bias + H1 BOS + M15 confirm, then RETEST ENTRY:
+                    a CLOSED H1 candle breaks structure, price pulls back to the
+                    broken level, an M5 candle rejects it. Stop goes beyond the
+                    retest high/low. (TREND_MODE=OLD on Render brings the old
+                    first-M5-close entry back as the live signal.)
   2. TIGHT BREAKOUT M30 squeeze box, M15 break holds, M5 retest rejects the edge
 
   Also kept: trade tracker (TP / SL alerts), daily trade log + CSV,
   WATCH / READY early alerts, VALID UNTIL message, heartbeat, sleep window.
 
-  Removed on purpose: CHOP, TIGHT FAKE-OUT, silent test signals, retest trend
-  mode and the signal blocks. Nothing here blocks a BOS or TIGHT BREAKOUT signal
-  except the old rules (cooldown, TREND_MAX_OPEN stacking limit).
+  The old first-M5-close BOS entry keeps running SILENTLY as "OLD-TREND" in the
+  trade log (never sent to Telegram), so the two entries can be compared.
+
+  Removed on purpose: CHOP, TIGHT FAKE-OUT, the other silent tests and the
+  signal blocks. Nothing here blocks a BOS or TIGHT BREAKOUT signal except the
+  cooldowns and the TREND_MAX_OPEN stacking limit.
 """
 
 import os
@@ -117,6 +124,20 @@ BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry 
 # Max BOS trend signals open at once in the same direction (never applies to
 # TIGHT BREAKOUT). Set TREND_MAX_OPEN=0 on Render to turn it off.
 TREND_MAX_OPEN  = int(os.environ.get("TREND_MAX_OPEN", "1"))
+
+# ── BOS TREND ENTRY MODE ──────────────────────────────────
+# RETEST (default): wait for a CLOSED H1 break, then for price to pull back to the
+#   broken level and an M5 candle to reject it. Stop = beyond the retest extreme.
+# OLD: the previous BOS entry (first M5 close beyond structure, stop = BOS wick
+#   +/- 10). In RETEST mode the OLD entry still runs silently as "OLD-TREND".
+TREND_MODE      = os.environ.get("TREND_MODE", "RETEST").upper()
+RT_TOL          = float(os.environ.get("RT_TOL", "4"))          # M5 must come back within this many pts of the broken level
+RT_OVER         = float(os.environ.get("RT_OVER", "8"))         # ...but not push more than this beyond it (break failed)
+RT_BUFFER       = float(os.environ.get("RT_BUFFER", "3"))       # stop sits this far beyond the retest extreme
+RT_MIN_RISK     = float(os.environ.get("RT_MIN_RISK", "4"))     # skip if stop is closer/wider than these (points)
+RT_MAX_RISK     = float(os.environ.get("RT_MAX_RISK", "30"))
+RT_COOLDOWN     = float(os.environ.get("RT_COOLDOWN", "14400")) # one signal per broken level per this many seconds
+TEST_CREDIT_CAP = int(os.environ.get("TEST_CREDIT_CAP", "700")) # no NEW silent OLD-TREND logging above this many Twelve Data calls today
 
 # ── TRADE LOG ─────────────────────────────────────────────
 # Every closed trade is written to a CSV and summarised on Telegram when the bot
@@ -568,8 +589,9 @@ def _load_trade_log():
     log_cursor = len(trade_log)
 
 def _kind_label(t):
-    """Name written to the log: TREND (SKIPPED) for silently tracked trades, else plain."""
-    if t.get("shadow"):
+    """Name written to the log: TREND (SKIPPED) for trades skipped by the stacking
+    limit, OLD-TREND for the silent old entry, else plain."""
+    if t.get("shadow") and not t.get("test"):
         return t["kind"] + " (SKIPPED)"
     return t["kind"]
 
@@ -967,13 +989,266 @@ def early_alerts(pair, h4, h1, m15, m5, now_ts, now_str):
     if not EARLY_ALERTS:
         return
     try:
-        _early_trend(pair, h4, h1, m15, m5, now_ts, now_str)
+        if TREND_MODE == "RETEST":
+            _early_retest(pair, h4, h1, m15, m5, now_ts, now_str)
+        else:
+            _early_trend(pair, h4, h1, m15, m5, now_ts, now_str)
     except Exception as e:
         print(f"{pair}: early trend alert error: {e}")
     try:
         _early_tight(pair, h1, m15, m5, now_ts, now_str)
     except Exception as e:
         print(f"{pair}: early tight alert error: {e}")
+
+
+# ======================================================================
+# BOS TREND: RETEST ENTRY (live in TREND_MODE=RETEST)
+# ======================================================================
+def _dt(s):
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _closed_break(candles, direction, max_age):
+    """Most recent CLOSED candle (index 1..max_age; index 0 is still forming)
+    whose close is beyond the extreme of the 5 candles before it, and which no
+    later closed candle has closed back through. Returns (index, level) or None."""
+    for k in range(1, max_age + 1):
+        base = candles[k + 1:k + 6]
+        if len(base) < 5:
+            return None
+        if direction == "BEARISH":
+            lvl = min(c["l"] for c in base)
+            if candles[k]["c"] < lvl and all(c["c"] < lvl for c in candles[1:k]):
+                return k, lvl
+        else:
+            lvl = max(c["h"] for c in base)
+            if candles[k]["c"] > lvl and all(c["c"] > lvl for c in candles[1:k]):
+                return k, lvl
+    return None
+
+
+def _retest(m5, direction, lvl, cutoff, tol, over):
+    """Looks at the M5 candles after the break. Returns the retest candle (the one
+    that reached back to the broken level) or None. The last closed M5 candle must
+    have rejected the level (closed back on the break side, in the break direction)."""
+    post = [c for c in m5 if (_dt(c["t"]) or cutoff) >= cutoff]
+    if len(post) < 2 or len(m5) < 2:
+        return None
+    last = m5[1]
+    if (_dt(last["t"]) or cutoff) < cutoff:
+        return None
+    if direction == "BEARISH":
+        probe = max(post, key=lambda c: c["h"])
+        if not (lvl - tol <= probe["h"] <= lvl + over):
+            return None
+        if not (last["c"] < lvl and last["c"] < last["o"]):
+            return None
+    else:
+        probe = min(post, key=lambda c: c["l"])
+        if not (lvl - over <= probe["l"] <= lvl + tol):
+            return None
+        if not (last["c"] > lvl and last["c"] > last["o"]):
+            return None
+    return probe
+
+
+def _h1_break_ctx(h4, h1, m15):
+    """Direction + closed H1 break, shared by the signal and its WATCH/READY alerts.
+    Same direction rules as the old BOS signal (H4/H1 bias, H1 MACD strength, M15
+    confirm). Returns (h4b, h1_macd, k, level, t_break) or None."""
+    h4b = bias(h4)
+    if h4b == "NEUTRAL":
+        h4b = bias(m15)
+    if h4b == "NEUTRAL" or h4b != bias(h1):
+        return None
+    h1m = macd_value(h1)
+    if h4b == "BEARISH" and h1m > -5:
+        return None
+    if h4b == "BULLISH" and h1m < 5:
+        return None
+    if bias(m15) != h4b:
+        return None                       # M15 confirm
+    brk = _closed_break(h1, h4b, 3)
+    if not brk:
+        return None
+    k, lvl = brk
+    t_break = _dt(h1[k]["t"])
+    if t_break is None:
+        return None
+    return h4b, h1m, k, lvl, t_break
+
+
+def h1_retest_signal(h4, h1, m15, m5):
+    """BOS retest signal: closed H1 break, M5 retest + rejection of the broken
+    level, stop beyond the retest extreme. Returns a dict or None."""
+    ctx = _h1_break_ctx(h4, h1, m15)
+    if not ctx:
+        return None
+    h4b, h1m, k, lvl, t_break = ctx
+    probe = _retest(m5, h4b, lvl, t_break + timedelta(hours=1), RT_TOL, RT_OVER)
+    if not probe:
+        return None
+    entry = m5[0]["c"]
+    if h4b == "BEARISH":
+        sl, side = probe["h"] + RT_BUFFER, "SELL"
+        risk = sl - entry
+    else:
+        sl, side = probe["l"] - RT_BUFFER, "BUY"
+        risk = entry - sl
+    if not (RT_MIN_RISK <= risk <= RT_MAX_RISK):
+        return None
+    return {"side": side, "dir": h4b, "entry": entry, "sl": sl, "risk": risk,
+            "level": lvl, "h1macd": h1m}
+
+
+def _trend_open_same(pair, side):
+    return sum(1 for t in active_trades
+               if t["kind"] == "TREND" and t["pair"] == pair
+               and t["direction"] == side and not t.get("shadow"))
+
+
+def trend_retest_live(pair, h4, h1, m15, m5, condition, now_ts, now_str):
+    """Sends the live BOS trend signal (retest entry). One signal per broken level."""
+    sig = h1_retest_signal(h4, h1, m15, m5)
+    if not sig:
+        return
+    side, h4b = sig["side"], sig["dir"]
+    entry, sl, risk, lvl = sig["entry"], sig["sl"], sig["risk"], sig["level"]
+    key = f"{pair}_rt_{side}_{int(lvl)}"
+    if now_ts - last_signal_time.get(key, 0) < RT_COOLDOWN:
+        return
+    sign = 1 if side == "BUY" else -1
+    tps = [("TP1", entry + sign * risk),
+           ("TP2", entry + sign * risk * 2),
+           ("TP3", entry + sign * risk * 3)]
+    liq_ok = liquidity_grab(m15, h4b)
+    res_pts, sup_pts = sr_nearest(h1, h4, entry)
+    meta = {"cond": condition, "liq": "yes" if liq_ok else "no",
+            "res": res_pts, "sup": sup_pts, "h1macd": round(sig["h1macd"], 1)}
+
+    # stacking limit: tracked silently, one short message (same as the old signal)
+    if TREND_MAX_OPEN > 0 and _trend_open_same(pair, side) >= TREND_MAX_OPEN:
+        print(f"{pair}: trend {side} already open - retest signal skipped")
+        last_signal_time[key] = now_ts
+        send(f"⏭ TREND {side} skipped — {pair}\n"
+             f"A trend {side} is still open, so no new one was sent.\n"
+             f"Would-be entry: {entry:.4f}\n"
+             f"I'll track it silently and show how it ended in the daily log.\n"
+             f"Time: {now_str}")
+        add_trade(pair, "TREND", side, entry, sl, tps, meta=meta, shadow=True)
+        return
+
+    emoji = "🔴" if side == "SELL" else "🟢"
+    liq = "✅" if liq_ok else "❌"
+    msg = (
+        f"{emoji} SIGNAL ALERT — {pair}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"Direction : {side}\n"
+        f"Entry     : {entry:.4f}\n"
+        f"Stop Loss : {sl:.4f}  ({pips(entry, sl)} pips)\n"
+        f"TP1 (1:1) : {tps[0][1]:.4f}  ({pips(entry, tps[0][1])} pips)\n"
+        f"TP2 (1:2) : {tps[1][1]:.4f}  ({pips(entry, tps[1][1])} pips)\n"
+        f"TP3 (1:3) : {tps[2][1]:.4f}  ({pips(entry, tps[2][1])} pips)\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"H4 Bias      : {h4b}\n"
+        f"H1 BOS       : ✅ (candle closed)\n"
+        f"M15 Confirm  : ✅\n"
+        f"M5 Retest    : ✅ rejected {lvl:.2f}\n"
+        f"Liq. Grab    : {liq}\n"
+        f"{sr_summary(h1, h4, h4b, entry)}"
+        f"R:R (TP2)    : 1:2.0\n"
+        f"Pip size     : {PIP_SIZE:g}\n"
+        f"Time         : {now_str}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Confirm on chart. Use 2% risk. Stop is beyond the retest {'high' if side == 'SELL' else 'low'}."
+    )
+    send(msg)
+    last_signal_time[key] = now_ts
+    add_trade(pair, "TREND", side, entry, sl, tps, meta=meta)
+    print(f"{pair}: RETEST trend signal sent: {side} @ {entry:.4f}")
+
+
+def _early_retest(pair, h4, h1, m15, m5, now_ts, now_str):
+    """WATCH (H1 closed through structure, waiting for the pullback) and READY
+    (price is at the retest zone, waiting for the M5 rejection)."""
+    ctx = _h1_break_ctx(h4, h1, m15)
+    if not ctx or not m5:
+        return
+    h4b, h1m, k, lvl, t_break = ctx
+    side = "SELL" if h4b == "BEARISH" else "BUY"
+    if now_ts - last_signal_time.get(f"{pair}_rt_{side}_{int(lvl)}", 0) < RT_COOLDOWN:
+        return                      # already signalled at this level
+    if h1_retest_signal(h4, h1, m15, m5):
+        return                      # the real signal fires now
+    if TREND_MAX_OPEN > 0 and _trend_open_same(pair, side) >= TREND_MAX_OPEN:
+        return
+    price = m5[0]["c"]
+    up = h4b == "BULLISH"
+    if up:
+        in_zone = lvl - RT_OVER <= price <= lvl + RT_TOL
+        away    = price > lvl + RT_TOL
+    else:
+        in_zone = lvl - RT_TOL <= price <= lvl + RT_OVER
+        away    = price < lvl - RT_TOL
+    word = "above" if up else "below"
+    if in_zone:
+        if _early_ok((pair, "RT READY", side, int(lvl)), READY_COOLDOWN):
+            send(f"🟠 READY — {side} (trend retest) — {pair}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"H1 closed {word} {lvl:.2f} and price is back at that level.\n"
+                 f"Price     : {price:.2f}\n"
+                 f"Fires when: an M5 candle rejects it and closes {word} {lvl:.2f}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"Not an entry yet: wait for the SIGNAL ALERT.\n"
+                 f"Time: {now_str}")
+    elif away:
+        if _early_ok((pair, "RT WATCH", side, int(lvl)), WATCH_COOLDOWN):
+            send(f"👀 WATCH — {side} (trend retest) forming — {pair}\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"H4/H1 bias {h4b}. H1 candle closed {word} {lvl:.2f}.\n"
+                 f"Price: {price:.2f}\n"
+                 f"Waiting for a pullback to {lvl:.2f}, then an M5 rejection.\n"
+                 f"━━━━━━━━━━━━━━━━\n"
+                 f"Not an entry. Do not chase the move.\n"
+                 f"Time: {now_str}")
+
+
+def old_bos_setup(h4, h1, m15, m5, now_ts):
+    """The old BOS entry conditions (first M5 close beyond structure).
+    Returns (h4b, h1_macd, h1_wick) when every condition is met, else None."""
+    pair = PAIRS[0]
+    h4b = bias(h4)
+    print(f"{pair} H4: {h4b}")
+    if h4b == "NEUTRAL":
+        h4b = bias(m15)
+    if h4b != bias(h1):
+        print(f"{pair}: H4/H1 conflict — skip"); return None
+
+    h1_macd = macd_value(h1)
+    if h4b == "BEARISH" and h1_macd > -5:
+        print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); return None
+    if h4b == "BULLISH" and h1_macd < 5:
+        print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); return None
+
+    h1_bos, h1_wick, _ = bos(h1, h4b)
+    print(f"{pair} H1 BOS: {h1_bos}")
+    if not h1_bos:
+        return None
+
+    if abs(m5[0]["c"] - h1_wick) > 15.0:
+        print(f"{pair}: Price not at BOS level - waiting"); return None
+    if bias(m15) != h4b:
+        print(f"{pair}: M15 not aligned"); return None
+    if not macd_aligned(h1, h4b):
+        print(f"{pair}: MACD conflict"); return None
+    if not m5_trigger(m5, h4b):
+        print(f"{pair}: M5 not triggered"); return None
+    if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
+        print(f"{pair}: Cooldown"); return None
+    return h4b, h1_macd, h1_wick
 
 
 # ── SCAN ──────────────────────────────────────────────────
@@ -1101,44 +1376,46 @@ def scan():
             except Exception as e:
                 print(f"{pair}: tight signal error: {e}")
 
-        # ── BOS TREND SIGNAL (exactly as it was) ──────────
-        h4b = bias(h4)
-        print(f"{pair} H4: {h4b}")
-        if h4b == "NEUTRAL":
-            h4b = bias(m15)
-        if h4b != bias(h1):
-            print(f"{pair}: H4/H1 conflict — skip"); continue
+        # ── BOS TREND SIGNAL ──────────────────────────────
+        old = old_bos_setup(h4, h1, m15, m5, now_ts)
 
-        h1_macd = macd_value(h1)
-        if h4b == "BEARISH" and h1_macd > -5:
-            print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); continue
-        if h4b == "BULLISH" and h1_macd < 5:
-            print(f"{pair}: H1 MACD too weak ({h1_macd:.2f}) — skip"); continue
+        if TREND_MODE == "RETEST":
+            # LIVE: closed H1 break + M5 retest entry
+            try:
+                trend_retest_live(pair, h4, h1, m15, m5, condition, now_ts, now_str)
+            except Exception as e:
+                print(f"{pair}: retest trend error: {e}")
+            # SILENT: the old entry, logged as OLD-TREND so the two can be compared
+            if old:
+                last_signal_time[pair] = now_ts
+                if calls_today() < TEST_CREDIT_CAP:
+                    try:
+                        o_h4b, o_macd, o_wick = old
+                        o_entry = m5[0]["c"]
+                        o_sl, o_tp1, o_tp2, o_tp3 = levels(o_entry, o_h4b, o_wick if o_wick else o_entry)
+                        o_res, o_sup = sr_nearest(h1, h4, o_entry)
+                        add_trade(pair, "OLD-TREND", "SELL" if o_h4b == "BEARISH" else "BUY",
+                                  o_entry, o_sl,
+                                  [("TP1", o_tp1), ("TP2", o_tp2), ("TP3", o_tp3)],
+                                  meta={"cond": condition,
+                                        "liq": "yes" if liquidity_grab(m15, o_h4b) else "no",
+                                        "res": o_res, "sup": o_sup,
+                                        "h1macd": round(o_macd, 1)},
+                                  shadow=True)
+                        active_trades[-1]["test"] = True
+                    except Exception as e:
+                        print(f"{pair}: old-trend logging error: {e}")
+            continue
 
-        h1_bos, h1_wick, _ = bos(h1, h4b)
-        print(f"{pair} H1 BOS: {h1_bos}")
-        if not h1_bos: continue
-
-        current_price = m5[0]["c"]
-        tolerance = 15.0
-        if abs(current_price - h1_wick) > tolerance:
-            print(f"{pair}: Price not at BOS level - waiting"); continue
-
-        if bias(m15) != h4b:
-            print(f"{pair}: M15 not aligned"); continue
-        if not macd_aligned(h1, h4b):
-            print(f"{pair}: MACD conflict"); continue
-        if not m5_trigger(m5, h4b):
-            print(f"{pair}: M5 not triggered"); continue
-        if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
-            print(f"{pair}: Cooldown"); continue
+        # ── TREND_MODE=OLD: the previous BOS entry, live ──
+        if not old:
+            continue
+        h4b, h1_macd, h1_wick = old
 
         # ── TREND STACKING LIMIT (trend signals only) ─────
         if TREND_MAX_OPEN > 0:
             side = "SELL" if h4b == "BEARISH" else "BUY"
-            open_same = sum(1 for t in active_trades
-                            if t["kind"] == "TREND" and t["pair"] == pair
-                            and t["direction"] == side and not t.get("shadow"))
+            open_same = _trend_open_same(pair, side)
             if open_same >= TREND_MAX_OPEN:
                 print(f"{pair}: {open_same} trend {side} already open — skip")
                 skip_key = f"{pair}_trend_skip_{side}"
@@ -1212,7 +1489,7 @@ def run_kpojime(announce=True):
     if announce:
         send(f"🚀 Kpojime Bot STARTED\n"
              f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
-             f"Signals: BOS trend + TIGHT BREAKOUT.\n"
+             f"Signals: BOS trend ({'retest entry' if TREND_MODE == 'RETEST' else 'old entry'}) + TIGHT BREAKOUT.\n"
              f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
              f"Heartbeat every 2 hours.")
     next_scan = 0
