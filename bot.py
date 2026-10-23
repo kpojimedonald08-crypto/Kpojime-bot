@@ -1,22 +1,15 @@
 """
-KPOJIME BOT - one Render service.
+KPOJIME BOT - one Render service. Two live signals only:
 
-  Part 1  shared Twelve Data helper (call spacing + daily counter)
-  Part 2  Kpojime bot: trend signal (H1 BOS) + chop signal (M15 range / M5 sweep)
-          + tight-market signals (M30 squeeze box, M15 break, M5 trigger):
-            TIGHT BREAKOUT  = break holds, M5 retest rejects the edge
-            TIGHT FAKE-OUT  = break fails, price closes back inside the box
-          + trade tracker (TP / SL alerts)
-          + early warning alerts (WATCH / READY) and VALID UNTIL messages
-          + silent test signals (TEST H1-RETEST, TEST LTF-RETEST): log only
-          + SIGNAL BLOCKS (opposite trade open / inside tight box / no room to
-            the next S/R level): blocked signals are tracked silently and
-            logged as BLOCKED-OPP / BLOCKED-BOX / BLOCKED-SR
-  Part 3  launcher: web server, self-ping, the bot, and an independent
-          heartbeat that keeps running while the bot sleeps or the API is down.
-          If the bot crashes it is restarted automatically.
+  1. BOS TREND      H4 bias + H1 BOS + M15 confirm + M5 trigger (exactly as it was)
+  2. TIGHT BREAKOUT M30 squeeze box, M15 break holds, M5 retest rejects the edge
 
-Start command stays: python sweep_bot.py
+  Also kept: trade tracker (TP / SL alerts), daily trade log + CSV,
+  WATCH / READY early alerts, VALID UNTIL message, heartbeat, sleep window.
+
+  Removed on purpose: CHOP, TIGHT FAKE-OUT, silent test signals, retest trend
+  mode and the signal blocks. Nothing here blocks a BOS or TIGHT BREAKOUT signal
+  except the old rules (cooldown, TREND_MAX_OPEN stacking limit).
 """
 
 import os
@@ -31,7 +24,6 @@ import requests
 
 # ======================================================================
 # PART 1 - SHARED TWELVE DATA HELPER
-# Both bots use the same key, so every call goes through td_get():
 #   * calls are spaced MIN_GAP seconds apart (free plan: 8 requests/minute)
 #   * calls are counted per UTC day (free plan: 800 credits/day)
 # ======================================================================
@@ -65,12 +57,12 @@ def td_get(url, params=None, timeout=15):
 
 
 def calls_today():
-    """Number of Twelve Data calls made today (UTC) by both bots."""
+    """Number of Twelve Data calls made today (UTC)."""
     return _count if _day == _today() else 0
 
 
 # ======================================================================
-# PART 2 - KPOJIME BOS BOT
+# PART 2 - KPOJIME BOT
 # ======================================================================
 
 def _utcnow():
@@ -93,28 +85,8 @@ HEARTBEAT_INTERVAL = 7200
 SLEEP_START_UTC = int(os.environ.get("SLEEP_START_UTC", "13"))
 WAKE_UTC        = int(os.environ.get("WAKE_UTC", "23"))
 
-# ── CHOP SIGNAL SETTINGS ──────────────────────────────────
-CHOP_ENABLED    = os.environ.get("CHOP_ENABLED", "1") == "1"
-CHOP_LOOKBACK   = 20      # M15 candles used to build the range
-CHOP_SL_BUFFER  = float(os.environ.get("CHOP_SL_BUFFER", "5.0"))
-CHOP_MIN_RANGE  = float(os.environ.get("CHOP_MIN_RANGE", "20.0"))
-CHOP_MAX_RANGE  = float(os.environ.get("CHOP_MAX_RANGE", "120.0"))
-CHOP_MIN_RR     = float(os.environ.get("CHOP_MIN_RR", "1.0"))
-# Filters that stop the bot fading a trend/breakout (fix for 3 straight stop-outs)
-CHOP_MAX_H1_MACD = float(os.environ.get("CHOP_MAX_H1_MACD", "2.0"))  # |H1 MACD| above this = trending, no chop trade
-CHOP_MAX_DRIFT   = float(os.environ.get("CHOP_MAX_DRIFT", "0.25"))   # range midpoint drift, as share of range width
-CHOP_MAX_SWEEP   = float(os.environ.get("CHOP_MAX_SWEEP", "0.25"))   # sweep deeper than this share of width = breakout
-CHOP_MIN_TOUCHES = int(os.environ.get("CHOP_MIN_TOUCHES", "2"))      # candles that must have tested each edge
-CHOP_EDGE_ZONE   = 0.2                                               # edge zone = 20% of range width
-CHOP_MAX_LOSSES  = int(os.environ.get("CHOP_MAX_LOSSES", "2"))       # consecutive chop SLs before pausing
-CHOP_PAUSE_HOURS = float(os.environ.get("CHOP_PAUSE_HOURS", "3"))
-
-# ── TIGHT-MARKET SIGNAL SETTINGS ──────────────────────────
-# Separate from the trend and chop signals. Turn the whole thing off with
-# TIGHT_ENABLED=0, or just one of the two with TIGHT_BREAKOUT=0 / TIGHT_FAKEOUT=0.
+# ── TIGHT BREAKOUT SETTINGS ───────────────────────────────
 TIGHT_ENABLED    = os.environ.get("TIGHT_ENABLED", "1") == "1"
-TIGHT_BREAKOUT   = os.environ.get("TIGHT_BREAKOUT", "1") == "1"
-TIGHT_FAKEOUT    = os.environ.get("TIGHT_FAKEOUT", "1") == "1"
 TIGHT_BARS       = int(os.environ.get("TIGHT_BARS", "5"))          # M30 bars in the squeeze (5 = 2.5h); box = last 2x this many M15 candles
 TIGHT_WINDOW     = int(os.environ.get("TIGHT_WINDOW", "4"))        # newest M15 candles where a break may happen (4 = 1h)
 TIGHT_SQUEEZE    = float(os.environ.get("TIGHT_SQUEEZE", "0.7"))   # avg M30 range must be <= this x the previous stretch
@@ -123,38 +95,15 @@ TIGHT_MAX_BOX    = float(os.environ.get("TIGHT_MAX_BOX", "35"))
 TIGHT_RETEST_TOL = float(os.environ.get("TIGHT_RETEST_TOL", "3"))  # M5 must come back within this many points of the broken edge
 TIGHT_SL_BUFFER  = float(os.environ.get("TIGHT_SL_BUFFER", "3"))
 TIGHT_MAX_RISK   = float(os.environ.get("TIGHT_MAX_RISK", "25"))   # skip if stop is wider than this (points)
-TIGHT_MIN_RR     = float(os.environ.get("TIGHT_MIN_RR", "1.0"))    # fake-out only: minimum R:R to TP2
 TIGHT_COOLDOWN   = float(os.environ.get("TIGHT_COOLDOWN", "7200")) # seconds; roughly one signal per box
 TIGHT_H1_ALIGN   = os.environ.get("TIGHT_H1_ALIGN", "0") == "1"    # 1 = breakout must agree with H1 MACD direction
 
-# ── REAL SUPPORT / RESISTANCE SETTINGS ────────────────────
+# ── REAL SUPPORT / RESISTANCE (alert text + trade log only, never blocks) ──
 SR_WARN_DIST = float(os.environ.get("SR_WARN_DIST", "20"))   # warn if a level is closer than this (points)
 SR_CLUSTER   = float(os.environ.get("SR_CLUSTER", "5"))      # swing points within this many points = one level
 SR_ROUND_STEP = float(os.environ.get("SR_ROUND_STEP", "50"))  # round-number levels every N points
 SR_ROUND_WARN = float(os.environ.get("SR_ROUND_WARN", "10"))  # warn on a round number only if this close
 SR_STRENGTH  = 2                                             # candles each side that must be lower/higher
-
-# ── SIGNAL BLOCKS (new 2026-10-23) ────────────────────────
-# A signal that is not worth taking is NOT sent. It is tracked silently and
-# written to the trade log as "BLOCKED-OPP / BLOCKED-BOX / BLOCKED-SR <kind>",
-# so you can check later whether a block saved you or cost you a winner.
-#   OPP : a live trade in the OPPOSITE direction is still open on that pair
-#         (applies to TREND, TIGHT and CHOP)
-#   BOX : (TREND only) a tight box is active and price is inside it or within
-#         TREND_BOX_BUFFER points of it
-#   SR  : the nearest opposing level (support below a SELL, resistance above a
-#         BUY) is closer than SR_MIN_R x the stop distance, unless Liq. Grab is
-#         ticked. Applies to TREND only.
-#   TIGHT BREAKOUT is never blocked by any rule (it has been performing well).
-#   TIGHT FAKE-OUT is blocked only by the OPP rule.
-# Switch everything off with BLOCK_ENABLED=0, or each rule on its own.
-BLOCK_ENABLED    = os.environ.get("BLOCK_ENABLED", "1") == "1"
-BLOCK_OPPOSITE   = os.environ.get("BLOCK_OPPOSITE", "1") == "1"
-BLOCK_BOX        = os.environ.get("BLOCK_BOX", "1") == "1"
-TREND_BOX_BUFFER = float(os.environ.get("TREND_BOX_BUFFER", "10"))  # points around the box edges
-BLOCK_SR         = os.environ.get("BLOCK_SR", "1") == "1"
-SR_MIN_R         = float(os.environ.get("SR_MIN_R", "2.0"))         # room needed to the next level, in R (2.0 = reaches TP2)
-BLOCK_NOTICE     = os.environ.get("BLOCK_NOTICE", "0") == "1"       # 1 = also send a short Telegram note when a signal is blocked
 
 # ── TRADE TRACKER SETTINGS ────────────────────────────────
 # While a signal is open the bot polls M1 candles (1 credit per poll, per pair)
@@ -162,27 +111,24 @@ BLOCK_NOTICE     = os.environ.get("BLOCK_NOTICE", "0") == "1"       # 1 = also s
 TRACK_INTERVAL  = int(os.environ.get("TRACK_INTERVAL", "120"))    # seconds between polls
 TRACK_MAX_HOURS = float(os.environ.get("TRACK_MAX_HOURS", "4"))   # stop tracking after this
 TRACK_TOLERANCE = float(os.environ.get("TRACK_TOLERANCE", "1.5"))  # TP counts as hit within this many points
-                                                                   # (broker and Twelve Data prices differ slightly)
 BE_AFTER_TP1    = os.environ.get("BE_AFTER_TP1", "1") == "1"      # treat entry as stop after TP1
 
 # ── TREND STACKING LIMIT ──────────────────────────────────
-# Max trend signals open at once in the same direction (applies to TREND only,
-# never to TIGHT or CHOP). A trade stays "open" until its final TP, SL or
-# breakeven alert, even after TP1. Set TREND_MAX_OPEN=0 on Render to turn it off.
+# Max BOS trend signals open at once in the same direction (never applies to
+# TIGHT BREAKOUT). Set TREND_MAX_OPEN=0 on Render to turn it off.
 TREND_MAX_OPEN  = int(os.environ.get("TREND_MAX_OPEN", "1"))
 
 # ── TRADE LOG ─────────────────────────────────────────────
 # Every closed trade is written to a CSV and summarised on Telegram when the bot
-# goes to sleep (13:00 UTC). Trend signals blocked by TREND_MAX_OPEN are tracked
-# silently ("TREND (SKIPPED)") so you can see whether the rule blocked winners.
+# goes to sleep (13:00 UTC). BOS signals skipped by TREND_MAX_OPEN are tracked
+# silently ("TREND (SKIPPED)").
 # NOTE: Render's free plan wipes files on every deploy/restart, so the daily CSV
 # sent to Telegram is your permanent copy.
 TRADE_LOG_PATH     = os.environ.get("TRADE_LOG_PATH", "/tmp/trade_log.csv")
 TRADE_LOG_SEND_CSV = os.environ.get("TRADE_LOG_SEND_CSV", "1") == "1"
 
 # ── PIPS ──────────────────────────────────────────────────
-# Price move that counts as 1 pip. Gold convention: 1 pip = 0.10 ($1 move = 10 pips).
-# If your broker counts 1 pip = 0.01, set PIP_SIZE=0.01 on Render.
+# Gold convention: 1 pip = 0.10 ($1 move = 10 pips). Set PIP_SIZE=0.01 if your broker differs.
 PIP_SIZE        = float(os.environ.get("PIP_SIZE", "0.1"))
 
 def pips(a, b):
@@ -380,30 +326,29 @@ def sr_levels(h1, h4):
         if candles and len(candles) >= 2 * SR_STRENGTH + 1:
             pts += [(price, tf) for price in _pivots(candles)]
     pts.sort()
-    levels, group = [], []
+    lv, group = [], []
     for price, tf in pts:
         if group and price - group[-1][0] > SR_CLUSTER:
-            levels.append(group); group = []
+            lv.append(group); group = []
         group.append((price, tf))
     if group:
-        levels.append(group)
+        lv.append(group)
     return [{"price": sum(p for p, _ in g) / len(g),
              "touches": len(g),
-             "tf": "H4" if any(tf == "H4" for _, tf in g) else "H1"} for g in levels]
+             "tf": "H4" if any(tf == "H4" for _, tf in g) else "H1"} for g in lv]
 
 def sr_summary(h1, h4, direction, entry):
     """Text lines for the signal: nearest resistance above and support below
-    the entry (swing levels + round numbers). Informational text only; the
-    blocking rule lives in check_blocks()."""
-    levels = sr_levels(h1, h4)
+    the entry (swing levels + round numbers). Information only, never blocks."""
+    lv = sr_levels(h1, h4)
     if SR_ROUND_STEP > 0:
         lower = (entry // SR_ROUND_STEP) * SR_ROUND_STEP
         for price in (lower, lower + SR_ROUND_STEP):
             if abs(price - entry) > 0.01:
-                levels.append({"price": price, "touches": 0, "tf": "ROUND"})
+                lv.append({"price": price, "touches": 0, "tf": "ROUND"})
 
-    above = [l for l in levels if l["price"] > entry]
-    below = [l for l in levels if l["price"] < entry]
+    above = [l for l in lv if l["price"] > entry]
+    below = [l for l in lv if l["price"] < entry]
     res = min(above, key=lambda l: l["price"]) if above else None
     sup = max(below, key=lambda l: l["price"]) if below else None
 
@@ -427,7 +372,7 @@ def sr_summary(h1, h4, direction, entry):
 
 def sr_nearest(h1, h4, entry):
     """Distance in points to the nearest resistance above and support below the
-    entry (same levels as sr_summary). Used for the trade log and the S/R block."""
+    entry. Used for the trade log."""
     lv = sr_levels(h1, h4)
     if SR_ROUND_STEP > 0:
         lower = (entry // SR_ROUND_STEP) * SR_ROUND_STEP
@@ -440,103 +385,7 @@ def sr_nearest(h1, h4, entry):
     sup = round(entry - max(below), 1) if below else ""
     return res, sup
 
-# ── CHOP SIGNAL (M15 range + M5 sweep & rejection) ────────
-def chop_signal(m15, m5, h1_macd=0.0):
-    """
-    Range = high/low of the M15 candles before the most recent 3 (45 min).
-    Signal when an M5 candle in the last 3 wicked beyond a range edge and the
-    latest M5 closed back inside the range with a rejection candle.
-
-    A real range must also pass these filters, otherwise a trend that keeps
-    making new highs/lows looks like endless "sweeps" and the bot fades it:
-      1. H1 momentum is weak (|H1 MACD| <= CHOP_MAX_H1_MACD)
-      2. Range midpoint is not drifting (older vs newer half of the lookback)
-      3. Both edges were tested at least CHOP_MIN_TOUCHES times
-      4. The sweep is shallow, and no recent M15 candle closed outside the range
-    Uses candles already fetched for the BOS scan, so no extra API calls.
-    Returns a dict or None.
-    """
-    if not m15 or len(m15) < CHOP_LOOKBACK + 3 or not m5 or len(m5) < 3:
-        return None
-    if abs(h1_macd) > CHOP_MAX_H1_MACD:
-        return None   # momentum too strong, not a range
-
-    rng      = m15[3:3 + CHOP_LOOKBACK]
-    r_high   = max(c["h"] for c in rng)
-    r_low    = min(c["l"] for c in rng)
-    width    = r_high - r_low
-    if width < CHOP_MIN_RANGE or width > CHOP_MAX_RANGE:
-        return None
-    mid      = (r_high + r_low) / 2
-
-    # drift: newer half vs older half of the range window
-    half = CHOP_LOOKBACK // 2
-    new_part, old_part = rng[:half], rng[half:]
-    new_mid = (max(c["h"] for c in new_part) + min(c["l"] for c in new_part)) / 2
-    old_mid = (max(c["h"] for c in old_part) + min(c["l"] for c in old_part)) / 2
-    if abs(new_mid - old_mid) > CHOP_MAX_DRIFT * width:
-        return None
-
-    # both edges must have been respected more than once
-    zone = CHOP_EDGE_ZONE * width
-    top_touches = sum(1 for c in rng if c["h"] >= r_high - zone)
-    bot_touches = sum(1 for c in rng if c["l"] <= r_low + zone)
-    if top_touches < CHOP_MIN_TOUCHES or bot_touches < CHOP_MIN_TOUCHES:
-        return None
-
-    latest   = m5[0]
-    recent   = m5[:3]
-    hi_wick  = max(c["h"] for c in recent)
-    lo_wick  = min(c["l"] for c in recent)
-    entry    = latest["c"]
-
-    swept_high = hi_wick > r_high
-    swept_low  = lo_wick < r_low
-    if swept_high and swept_low:
-        return None  # ambiguous, skip
-
-    # a close outside the range on M15 = breakout, not a sweep
-    recent_m15 = m15[:3]
-    if swept_high:
-        if hi_wick - r_high > CHOP_MAX_SWEEP * width:
-            return None
-        if any(c["c"] > r_high for c in recent_m15):
-            return None
-    if swept_low:
-        if r_low - lo_wick > CHOP_MAX_SWEEP * width:
-            return None
-        if any(c["c"] < r_low for c in recent_m15):
-            return None
-
-    if swept_high and mid < entry < r_high and latest["c"] < latest["o"]:
-        sl   = hi_wick + CHOP_SL_BUFFER
-        risk = sl - entry
-        if risk <= 0:
-            return None
-        tp1, tp2 = mid, r_low
-        rr2 = (entry - tp2) / risk
-        if rr2 < CHOP_MIN_RR:
-            return None
-        return {"direction": "SELL", "entry": entry, "sl": sl, "tp1": tp1,
-                "tp2": tp2, "rr2": round(rr2, 1), "r_high": r_high,
-                "r_low": r_low, "swept": "range high"}
-
-    if swept_low and r_low < entry < mid and latest["c"] > latest["o"]:
-        sl   = lo_wick - CHOP_SL_BUFFER
-        risk = entry - sl
-        if risk <= 0:
-            return None
-        tp1, tp2 = mid, r_high
-        rr2 = (tp2 - entry) / risk
-        if rr2 < CHOP_MIN_RR:
-            return None
-        return {"direction": "BUY", "entry": entry, "sl": sl, "tp1": tp1,
-                "tp2": tp2, "rr2": round(rr2, 1), "r_high": r_high,
-                "r_low": r_low, "swept": "range low"}
-
-    return None
-
-# ── TIGHT-MARKET SIGNALS (M30 squeeze box / M15 break / M5 trigger) ──
+# ── TIGHT BREAKOUT (M30 squeeze box / M15 break / M5 retest) ──
 def _m30_from_m15(m15):
     """Builds M30 candles from M15 candles (newest-first in, newest-first out).
     Only complete pairs (:00 + :15, or :30 + :45) are used. No extra API calls."""
@@ -591,9 +440,7 @@ def tight_signals(m15, m5, h1_macd=0.0):
     TIGHT BREAKOUT: an M15 candle closed outside the box, no M15 candle has
       closed back inside since, and an M5 candle retested the broken edge and
       closed away from it in the break direction.
-    TIGHT FAKE-OUT: an M15 candle closed outside the box, then a later M15
-      candle closed back inside; an M5 candle confirms the move back.
-    Uses candles already fetched for the other signals (no extra API calls).
+    Uses candles already fetched for the BOS scan (no extra API calls).
     Returns a list of signal dicts (usually empty).
     """
     box = tight_box(m15)
@@ -623,73 +470,38 @@ def tight_signals(m15, m5, h1_macd=0.0):
     since_break = win[:i + 1]             # break candle and everything after it
 
     held = all((c["c"] > hi) if up else (c["c"] < lo) for c in since_break)
+    if not held:
+        return []                         # break failed: no signal
+
     out = []
-
-    if held:
-        # ── BREAKOUT: break still holds; trade the M5 retest of the edge ──
-        if not TIGHT_BREAKOUT:
-            return []
-        if up:
-            probe   = min(c["l"] for c in last5)
-            touched = probe <= hi + TIGHT_RETEST_TOL
-            good    = entry > hi and bullish_m5
-            sl      = min(probe - TIGHT_SL_BUFFER, hi - 0.3 * width)
-            risk    = entry - sl
-            aligned = (not TIGHT_H1_ALIGN) or h1_macd > 0
-        else:
-            probe   = max(c["h"] for c in last5)
-            touched = probe >= lo - TIGHT_RETEST_TOL
-            good    = entry < lo and bearish_m5
-            sl      = max(probe + TIGHT_SL_BUFFER, lo + 0.3 * width)
-            risk    = sl - entry
-            aligned = (not TIGHT_H1_ALIGN) or h1_macd < 0
-        if touched and good and aligned and 0 < risk <= TIGHT_MAX_RISK:
-            sign = 1 if up else -1
-            tps = [("TP1", entry + sign * risk),
-                   ("TP2", entry + sign * risk * 2),
-                   ("TP3", entry + sign * risk * 3)]
-            out.append({"kind": "TIGHT BREAKOUT",
-                        "direction": "BUY" if up else "SELL",
-                        "entry": entry, "sl": sl, "tps": tps, "rr2": 2.0,
-                        "box": box,
-                        "setup": f"M15 closed {'above' if up else 'below'} box + M5 retest of the {'high' if up else 'low'}"})
-        return out
-
-    # ── FAKE-OUT: broke out, then closed back inside the box ──
-    if not TIGHT_FAKEOUT:
-        return []
-    if i == 0 or not (lo <= win[0]["c"] <= hi):
-        return []
     if up:
-        extreme = max(c["h"] for c in since_break)
-        if not (entry < hi and entry > mid and bearish_m5):
-            return []
-        sl   = extreme + TIGHT_SL_BUFFER
-        risk = sl - entry
-        tp1, tp2 = mid, lo
-        rr2  = (entry - tp2) / risk if risk > 0 else 0
-        direction = "SELL"
-        setup = "M15 broke above the box, closed back inside + M5 rejection"
+        probe   = min(c["l"] for c in last5)
+        touched = probe <= hi + TIGHT_RETEST_TOL
+        good    = entry > hi and bullish_m5
+        sl      = min(probe - TIGHT_SL_BUFFER, hi - 0.3 * width)
+        risk    = entry - sl
+        aligned = (not TIGHT_H1_ALIGN) or h1_macd > 0
     else:
-        extreme = min(c["l"] for c in since_break)
-        if not (entry > lo and entry < mid and bullish_m5):
-            return []
-        sl   = extreme - TIGHT_SL_BUFFER
-        risk = entry - sl
-        tp1, tp2 = mid, hi
-        rr2  = (tp2 - entry) / risk if risk > 0 else 0
-        direction = "BUY"
-        setup = "M15 broke below the box, closed back inside + M5 rejection"
-    if 0 < risk <= TIGHT_MAX_RISK and rr2 >= TIGHT_MIN_RR:
-        out.append({"kind": "TIGHT FAKE-OUT", "direction": direction,
-                    "entry": entry, "sl": sl,
-                    "tps": [("TP1", tp1), ("TP2", tp2)], "rr2": round(rr2, 1),
-                    "box": box, "setup": setup})
+        probe   = max(c["h"] for c in last5)
+        touched = probe >= lo - TIGHT_RETEST_TOL
+        good    = entry < lo and bearish_m5
+        sl      = max(probe + TIGHT_SL_BUFFER, lo + 0.3 * width)
+        risk    = sl - entry
+        aligned = (not TIGHT_H1_ALIGN) or h1_macd < 0
+    if touched and good and aligned and 0 < risk <= TIGHT_MAX_RISK:
+        sign = 1 if up else -1
+        tps = [("TP1", entry + sign * risk),
+               ("TP2", entry + sign * risk * 2),
+               ("TP3", entry + sign * risk * 3)]
+        out.append({"kind": "TIGHT BREAKOUT",
+                    "direction": "BUY" if up else "SELL",
+                    "entry": entry, "sl": sl, "tps": tps, "rr2": 2.0,
+                    "box": box,
+                    "setup": f"M15 closed {'above' if up else 'below'} box + M5 retest of the {'high' if up else 'low'}"})
     return out
 
 # ── TRADE TRACKER ─────────────────────────────────────────
 active_trades = []
-chop_state = {"losses": 0, "paused_until": 0}
 
 def add_trade(pair, kind, direction, entry, sl, tps, meta=None, shadow=False):
     """tps = [("TP1", price), ("TP2", price), ...] in order.
@@ -756,10 +568,8 @@ def _load_trade_log():
     log_cursor = len(trade_log)
 
 def _kind_label(t):
-    """Name written to the log: BLOCKED-SR TREND, TREND (SKIPPED), TEST ..., or plain."""
-    if t.get("blocked"):
-        return f"BLOCKED-{t['blocked']} {t['kind']}"
-    if t.get("shadow") and not t.get("test"):
+    """Name written to the log: TREND (SKIPPED) for silently tracked trades, else plain."""
+    if t.get("shadow"):
         return t["kind"] + " (SKIPPED)"
     return t["kind"]
 
@@ -904,14 +714,6 @@ def process_candle(t, c):
             say(f"❌ STOP LOSS HIT — {head}\n"
                 f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
             log_trade(t, "SL")
-            if t["kind"] == "CHOP" and not t.get("shadow"):
-                chop_state["losses"] += 1
-                if chop_state["losses"] >= CHOP_MAX_LOSSES:
-                    chop_state["paused_until"] = time.time() + CHOP_PAUSE_HOURS * 3600
-                    chop_state["losses"] = 0
-                    send(f"⏸ CHOP signals paused for {CHOP_PAUSE_HOURS:g}h "
-                         f"after {CHOP_MAX_LOSSES} stop-outs in a row.\n"
-                         f"Market is likely trending, not ranging.")
         return True
 
     while t["hit"] < len(t["tps"]):
@@ -919,8 +721,6 @@ def process_candle(t, c):
         if not _reached(t, c, price):
             break
         t["hit"] += 1
-        if t["kind"] == "CHOP" and not t.get("shadow"):
-            chop_state["losses"] = 0      # a win resets the loss streak
         final = t["hit"] == len(t["tps"])
         if final:
             tail = "🏁 Final target reached. Trade complete."
@@ -970,7 +770,7 @@ def track_trades():
 # ======================================================================
 # EARLY WARNING (WATCH / READY), VALID-UNTIL, EXTRA LOG DATA
 # Read-only add-on. Nothing in here decides whether a trade is taken.
-# Set EARLY_ALERTS=0 on Render to switch the new Telegram messages off.
+# Set EARLY_ALERTS=0 on Render to switch the WATCH/READY/VALID UNTIL messages off.
 # ======================================================================
 EARLY_ALERTS    = os.environ.get("EARLY_ALERTS", "1") == "1"
 EARLY_TIGHT     = os.environ.get("EARLY_TIGHT", "1") == "1"      # 0 = no WATCH/READY for tight boxes
@@ -979,7 +779,7 @@ READY_COOLDOWN  = float(os.environ.get("READY_COOLDOWN", "900"))   # seconds bet
 BOS_TOLERANCE   = 15.0   # same number the trend scan uses for "price at BOS level"
 VALID_FRAC      = float(os.environ.get("VALID_FRAC", "0.3"))     # entry stale after this share of 1R is gone
 VALID_MINUTES   = int(os.environ.get("VALID_MINUTES", "30"))     # ...or after this many minutes
-H4_CACHE_MIN    = float(os.environ.get("H4_CACHE_MIN", "30"))    # reuse H4 candles this many minutes (saves ~140 credits/day); 0 = fetch every scan
+H4_CACHE_MIN    = float(os.environ.get("H4_CACHE_MIN", "30"))    # reuse H4 candles this many minutes (saves credits); 0 = fetch every scan
 
 early_sent = {}
 
@@ -1041,7 +841,7 @@ def send_valid_until(pair, kind, direction, entry, sl):
 
 
 def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
-    """WATCH / READY for the trend signal. Mirrors the trend conditions but only reads."""
+    """WATCH / READY for the BOS trend signal. Mirrors the trend conditions but only reads."""
     if now_ts - last_signal_time.get(pair, 0) < signal_cooldown:
         return
     h4b = bias(h4)
@@ -1065,12 +865,6 @@ def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
                         if t["kind"] == "TREND" and t["pair"] == pair
                         and t["direction"] == side and not t.get("shadow"))
         if open_same >= TREND_MAX_OPEN:
-            return
-    # No WATCH/READY for a setup the signal blocks (opposite trade open, or inside a tight box)
-    if BLOCK_ENABLED:
-        if BLOCK_OPPOSITE and _opposite_open(pair, side):
-            return
-        if BLOCK_BOX and _near_tight_box(m15, m5[0]["c"]):
             return
 
     price    = m5[0]["c"]
@@ -1118,7 +912,7 @@ def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
 
 
 def _early_tight(pair, h1, m15, m5, now_ts, now_str):
-    """WATCH (box formed) and READY (break closed, waiting for M5 retest) for TIGHT."""
+    """WATCH (box formed) and READY (break closed, waiting for M5 retest) for TIGHT BREAKOUT."""
     if not (TIGHT_ENABLED and EARLY_TIGHT) or not m5 or len(m5) < 3:
         return
     box = tight_box(m15)
@@ -1151,8 +945,8 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
     side, i = brk
     up = side == "UP"
     held = all((c["c"] > hi) if up else (c["c"] < lo) for c in win[:i + 1])
-    if not held or not TIGHT_BREAKOUT:
-        return                      # failed break: the fake-out logic handles it
+    if not held:
+        return                      # failed break: nothing to wait for
     edge = hi if up else lo
     if _early_ok((pair, "TIGHT READY", tag, side), TIGHT_COOLDOWN):
         send(f"🟠 READY — TIGHT BREAKOUT {'BUY' if up else 'SELL'} — {pair}\n"
@@ -1180,319 +974,6 @@ def early_alerts(pair, h4, h1, m15, m5, now_ts, now_str):
         _early_tight(pair, h1, m15, m5, now_ts, now_str)
     except Exception as e:
         print(f"{pair}: early tight alert error: {e}")
-
-
-# ======================================================================
-# SILENT TEST SIGNALS (log only: nothing is ever sent to Telegram)
-#   TEST H1-RETEST  = H1 candle CLOSES beyond structure, then M5 retests the
-#                     broken level and rejects it (your BOS retest, done properly)
-#   TEST LTF-RETEST = M15 candle closes beyond structure, M5 retests the broken
-#                     level, M1 gives the trigger (M15 / M5 / M1)
-# They are tracked like the "(SKIPPED)" trades and appear in the daily log and
-# CSV under their own names, so you can compare them with TREND and TIGHT.
-# TEST_ENABLED=0 on Render switches both off.
-# ======================================================================
-TEST_ENABLED    = os.environ.get("TEST_ENABLED", "1") == "1"
-H1RT_ENABLED    = os.environ.get("H1RT_ENABLED", "1") == "1"
-LTF_ENABLED     = os.environ.get("LTF_ENABLED", "1") == "1"
-TEST_MAX_OPEN   = int(os.environ.get("TEST_MAX_OPEN", "3"))        # open test trades at once
-TEST_CREDIT_CAP = int(os.environ.get("TEST_CREDIT_CAP", "700"))    # no NEW test trades above this many Twelve Data calls today
-TEST_HARD_CAP   = int(os.environ.get("TEST_HARD_CAP", "750"))      # above this, open test trades are closed to protect live tracking
-
-H1RT_TOL        = float(os.environ.get("H1RT_TOL", "4"))           # M5 must come back within this many pts of the broken level
-H1RT_OVER       = float(os.environ.get("H1RT_OVER", "8"))          # ...but not push more than this beyond it (break failed)
-H1RT_BUFFER     = float(os.environ.get("H1RT_BUFFER", "3"))        # stop sits this far beyond the retest extreme
-H1RT_MIN_RISK   = float(os.environ.get("H1RT_MIN_RISK", "4"))
-H1RT_MAX_RISK   = float(os.environ.get("H1RT_MAX_RISK", "30"))
-H1RT_COOLDOWN   = float(os.environ.get("H1RT_COOLDOWN", "3600"))
-H1RT_MAX_HOURS  = float(os.environ.get("H1RT_MAX_HOURS", "3"))
-
-LTF_MIN_MACD    = float(os.environ.get("LTF_MIN_MACD", "1.0"))     # |M15 MACD| needed to pick a direction
-LTF_TOL         = float(os.environ.get("LTF_TOL", "2"))
-LTF_OVER        = float(os.environ.get("LTF_OVER", "5"))
-LTF_BUFFER      = float(os.environ.get("LTF_BUFFER", "2"))
-LTF_MIN_RISK    = float(os.environ.get("LTF_MIN_RISK", "3"))
-LTF_MAX_RISK    = float(os.environ.get("LTF_MAX_RISK", "12"))
-LTF_COOLDOWN    = float(os.environ.get("LTF_COOLDOWN", "900"))
-LTF_MAX_HOURS   = float(os.environ.get("LTF_MAX_HOURS", "1.5"))
-
-test_last = {}
-
-
-def _dt(s):
-    try:
-        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def _closed_break(candles, direction, max_age):
-    """Most recent CLOSED candle (index 1..max_age; index 0 is still forming)
-    whose close is beyond the extreme of the 5 candles before it, and which no
-    later closed candle has closed back through. Returns (index, level) or None."""
-    for k in range(1, max_age + 1):
-        base = candles[k + 1:k + 6]
-        if len(base) < 5:
-            return None
-        if direction == "BEARISH":
-            lvl = min(c["l"] for c in base)
-            if candles[k]["c"] < lvl and all(c["c"] < lvl for c in candles[1:k]):
-                return k, lvl
-        else:
-            lvl = max(c["h"] for c in base)
-            if candles[k]["c"] > lvl and all(c["c"] > lvl for c in candles[1:k]):
-                return k, lvl
-    return None
-
-
-def _retest(m5, direction, lvl, cutoff, tol, over):
-    """Looks at the M5 candles after the break. Returns the retest candle (the one
-    that reached back to the broken level) or None. The last closed M5 candle must
-    have rejected the level (closed back on the break side, in the break direction)."""
-    post = [c for c in m5 if (_dt(c["t"]) or cutoff) >= cutoff]
-    if len(post) < 2 or len(m5) < 2:
-        return None
-    last = m5[1]
-    if (_dt(last["t"]) or cutoff) < cutoff:
-        return None
-    if direction == "BEARISH":
-        probe = max(post, key=lambda c: c["h"])
-        if not (lvl - tol <= probe["h"] <= lvl + over):
-            return None
-        if not (last["c"] < lvl and last["c"] < last["o"]):
-            return None
-    else:
-        probe = min(post, key=lambda c: c["l"])
-        if not (lvl - over <= probe["l"] <= lvl + tol):
-            return None
-        if not (last["c"] > lvl and last["c"] > last["o"]):
-            return None
-    return probe
-
-
-def h1_retest_signal(h4, h1, m15, m5):
-    """TEST H1-RETEST. Same direction rules as the trend signal, but the H1 break
-    must be a CLOSED candle and entry waits for the M5 retest + rejection."""
-    h4b = bias(h4)
-    if h4b == "NEUTRAL":
-        h4b = bias(m15)
-    if h4b == "NEUTRAL" or h4b != bias(h1):
-        return None
-    h1m = macd_value(h1)
-    if h4b == "BEARISH" and h1m > -5:
-        return None
-    if h4b == "BULLISH" and h1m < 5:
-        return None
-    brk = _closed_break(h1, h4b, 3)
-    if not brk:
-        return None
-    k, lvl = brk
-    t_break = _dt(h1[k]["t"])
-    if t_break is None:
-        return None
-    probe = _retest(m5, h4b, lvl, t_break + timedelta(hours=1), H1RT_TOL, H1RT_OVER)
-    if not probe:
-        return None
-    entry = m5[0]["c"]
-    if h4b == "BEARISH":
-        sl, side = probe["h"] + H1RT_BUFFER, "SELL"
-        risk = sl - entry
-    else:
-        sl, side = probe["l"] - H1RT_BUFFER, "BUY"
-        risk = entry - sl
-    if not (H1RT_MIN_RISK <= risk <= H1RT_MAX_RISK):
-        return None
-    return {"side": side, "dir": h4b, "entry": entry, "sl": sl, "risk": risk,
-            "level": lvl, "h1macd": h1m}
-
-
-def ltf_retest_signal(m15, m5, get_m1):
-    """TEST LTF-RETEST. M15 closed break, M5 retest + rejection, M1 trigger.
-    get_m1() costs 1 Twelve Data credit and is only called when M15 and M5 already agree."""
-    mv = macd_value(m15)
-    if abs(mv) < LTF_MIN_MACD:
-        return None
-    direction = "BEARISH" if mv < 0 else "BULLISH"
-    brk = _closed_break(m15, direction, 4)
-    if not brk:
-        return None
-    k, lvl = brk
-    t_break = _dt(m15[k]["t"])
-    if t_break is None:
-        return None
-    cutoff = t_break + timedelta(minutes=15)
-    probe = _retest(m5, direction, lvl, cutoff, LTF_TOL, LTF_OVER)
-    if not probe:
-        return None
-    t_probe = _dt(probe["t"])
-    m1 = get_m1()
-    if not m1 or len(m1) < 8 or t_probe is None:
-        return None
-    trig = None
-    for j in range(1, 4):                         # last 3 CLOSED M1 candles
-        base = m1[j + 1:j + 4]
-        c = m1[j]
-        ct = _dt(c["t"])
-        if len(base) < 3 or ct is None or ct < t_probe:
-            continue
-        if direction == "BEARISH":
-            if c["c"] < min(x["l"] for x in base) and c["c"] < lvl and c["c"] < c["o"]:
-                trig = c
-                break
-        else:
-            if c["c"] > max(x["h"] for x in base) and c["c"] > lvl and c["c"] > c["o"]:
-                trig = c
-                break
-    if not trig:
-        return None
-    entry = trig["c"]
-    if direction == "BEARISH":
-        sl, side = probe["h"] + LTF_BUFFER, "SELL"
-        risk = sl - entry
-    else:
-        sl, side = probe["l"] - LTF_BUFFER, "BUY"
-        risk = entry - sl
-    if not (LTF_MIN_RISK <= risk <= LTF_MAX_RISK):
-        return None
-    nxt = (_dt(trig["t"]) + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-    return {"side": side, "dir": direction, "entry": entry, "sl": sl, "risk": risk,
-            "level": lvl, "h1macd": None, "base_t": nxt}
-
-
-def _open_test(pair, kind, sig, max_hours, meta):
-    sign = 1 if sig["side"] == "BUY" else -1
-    tps = [("TP1", sig["entry"] + sign * sig["risk"]),
-           ("TP2", sig["entry"] + sign * sig["risk"] * 2),
-           ("TP3", sig["entry"] + sign * sig["risk"] * 3)]
-    add_trade(pair, kind, sig["side"], sig["entry"], sig["sl"], tps, meta=meta, shadow=True)
-    t = active_trades[-1]
-    t["test"] = True
-    if sig.get("base_t"):
-        t["base_t"] = sig["base_t"]               # replay from the M1 candle after the trigger
-    # shorter lifetime than live trades: pretend it was created earlier
-    t["created"] = time.time() - max(0.0, TRACK_MAX_HOURS - max_hours) * 3600
-
-
-def _drop_tests():
-    for t in active_trades[:]:
-        if t.get("test") or t.get("blocked"):
-            log_trade(t, "TIMEOUT")
-            active_trades.remove(t)
-
-
-def test_signals(pair, h4, h1, m15, m5, condition, now_ts):
-    """Called once per scan. Silent. Never changes a live signal."""
-    if not TEST_ENABLED:
-        return
-    used = calls_today()
-    if used >= TEST_HARD_CAP:
-        _drop_tests()
-        return
-    if used >= TEST_CREDIT_CAP:
-        return
-    if sum(1 for t in active_trades if t.get("test")) >= TEST_MAX_OPEN:
-        return
-
-    def taken(kind, side, cooldown):
-        key = (pair, kind, side)
-        if now_ts - test_last.get(key, 0) < cooldown:
-            return True
-        return any(t["kind"] == kind and t["direction"] == side for t in active_trades)
-
-    if H1RT_ENABLED:
-        sig = h1_retest_signal(h4, h1, m15, m5)
-        if sig and not taken("TEST H1-RETEST", sig["side"], H1RT_COOLDOWN):
-            res, sup = sr_nearest(h1, h4, sig["entry"])
-            _open_test(pair, "TEST H1-RETEST", sig, H1RT_MAX_HOURS,
-                       {"cond": condition, "liq": "yes" if liquidity_grab(m15, sig["dir"]) else "no",
-                        "res": res, "sup": sup, "h1macd": round(sig["h1macd"], 1)})
-            test_last[(pair, "TEST H1-RETEST", sig["side"])] = now_ts
-            print(f"{pair}: TEST H1-RETEST {sig['side']} @ {sig['entry']:.2f} (silent)")
-
-    if LTF_ENABLED and sum(1 for t in active_trades if t.get("test")) < TEST_MAX_OPEN:
-        sig = ltf_retest_signal(m15, m5, lambda: fetch(pair, "1min", 30))
-        if sig and not taken("TEST LTF-RETEST", sig["side"], LTF_COOLDOWN):
-            res, sup = sr_nearest(h1, h4, sig["entry"])
-            _open_test(pair, "TEST LTF-RETEST", sig, LTF_MAX_HOURS,
-                       {"cond": condition, "liq": "yes" if liquidity_grab(m15, sig["dir"]) else "no",
-                        "res": res, "sup": sup, "h1macd": round(macd_value(h1), 1)})
-            test_last[(pair, "TEST LTF-RETEST", sig["side"])] = now_ts
-            print(f"{pair}: TEST LTF-RETEST {sig['side']} @ {sig['entry']:.2f} (silent)")
-
-
-# ======================================================================
-# SIGNAL BLOCKS (OPP / BOX / SR)
-# check_blocks() is asked right before a signal is sent. If it says no, the
-# signal is not sent; log_blocked() tracks it silently so the trade log shows
-# how it would have ended ("BLOCKED-SR TREND", "BLOCKED-OPP TIGHT FAKE-OUT"...).
-# ======================================================================
-blocked_last = {}
-
-
-def _opposite_open(pair, side):
-    """True while a LIVE (non-silent) trade in the opposite direction is open."""
-    return any(t["pair"] == pair and not t.get("shadow") and t["direction"] != side
-               for t in active_trades)
-
-
-def _near_tight_box(m15, price):
-    """Returns the tight box if price is inside it or within TREND_BOX_BUFFER
-    points of its edges, else None."""
-    box = tight_box(m15)
-    if not box:
-        return None
-    if box["low"] - TREND_BOX_BUFFER <= price <= box["high"] + TREND_BOX_BUFFER:
-        return box
-    return None
-
-
-def check_blocks(pair, side, entry, sl, h1, h4, m15, liq_ok=False, sr_rule=False, box_rule=False):
-    """Returns (reason, detail) when the signal must be blocked, else None.
-    reason is "OPP", "BOX" or "SR". Never raises (a failure means: do not block)."""
-    if not BLOCK_ENABLED:
-        return None
-    try:
-        if BLOCK_OPPOSITE and _opposite_open(pair, side):
-            return "OPP", "an opposite-direction trade is still open"
-        if box_rule and BLOCK_BOX:
-            box = _near_tight_box(m15, entry)
-            if box:
-                return "BOX", (f"tight box {box['low']:.2f}-{box['high']:.2f} is active "
-                               f"and price is inside it or within {TREND_BOX_BUFFER:g} pts")
-        if sr_rule and BLOCK_SR and not liq_ok:
-            risk = abs(entry - sl)
-            if risk > 0:
-                res, sup = sr_nearest(h1, h4, entry)
-                room = sup if side == "SELL" else res
-                if room != "" and room is not None and room < SR_MIN_R * risk:
-                    lvl = "support" if side == "SELL" else "resistance"
-                    return "SR", (f"{lvl} only {room:.1f} pts away = {room / risk:.1f}R "
-                                  f"(needs {SR_MIN_R:g}R, stop is {risk:.1f} pts)")
-    except Exception as e:
-        print(f"{pair}: block check error: {e}")
-    return None
-
-
-def log_blocked(pair, kind, side, entry, sl, tps, meta, reason, detail, now_ts, now_str):
-    """Tracks a blocked signal silently (once per hour per kind/side/reason)."""
-    print(f"{pair}: {kind} {side} BLOCKED-{reason}: {detail}")
-    key = (pair, kind, side, reason)
-    if now_ts - blocked_last.get(key, 0) < signal_cooldown:
-        return
-    blocked_last[key] = now_ts
-    if BLOCK_NOTICE:
-        send(f"⛔ BLOCKED-{reason} — {kind} {side} — {pair}\n"
-             f"Reason: {detail}\n"
-             f"Would-be entry: {entry:.4f}\n"
-             f"Tracked silently; the outcome shows in the daily log.\n"
-             f"Time: {now_str}")
-    if calls_today() >= TEST_CREDIT_CAP:
-        return          # protect Twelve Data credits: block it, but don't track it
-    try:
-        add_trade(pair, kind, side, entry, sl, tps, meta=meta, shadow=True)
-        active_trades[-1]["blocked"] = reason
-    except Exception as e:
-        print(f"{pair}: blocked-trade tracking error: {e}")
 
 
 # ── SCAN ──────────────────────────────────────────────────
@@ -1552,7 +1033,7 @@ def scan():
                     f"⛔ NO TREND TRADE until breakout\n"
                     f"🔼 Above {r_high:.2f} = BUY opportunity\n"
                     f"🔽 Below {r_low:.2f} = SELL opportunity\n"
-                    f"↔️ CHOP sweep signals active (M15 range / M5 rejection)"
+                    f"📦 TIGHT BREAKOUT signals active"
                 )
             elif condition == "TRENDING BEARISH":
                 hb_msg = (
@@ -1582,41 +1063,15 @@ def scan():
         # ── EARLY WARNING (read-only, never blocks a signal) ──
         early_alerts(pair, h4, h1, m15, m5, now_ts, now_str)
 
-        # ── SILENT TEST SIGNALS (log only, never sent, never block anything) ──
-        try:
-            test_signals(pair, h4, h1, m15, m5, condition, now_ts)
-        except Exception as e:
-            print(f"{pair}: test signal error: {e}")
-
-        # ── TIGHT-MARKET SIGNALS (separate from trend + chop) ──
-        # Runs before the chop block and never skips the rest of the scan,
-        # so trend and chop behave exactly as before.
+        # ── TIGHT BREAKOUT ────────────────────────────────
+        # Never skips the rest of the scan, so the BOS signal below runs as usual.
         if TIGHT_ENABLED:
             try:
                 for sig in tight_signals(m15, m5, macd_value(h1)):
-                    is_break  = sig["kind"] == "TIGHT BREAKOUT"
-                    break_key = f"{pair}_tight_break"
-                    fake_key  = f"{pair}_tight_fake"
-                    key       = break_key if is_break else fake_key
+                    key = f"{pair}_tight_break"
                     if now_ts - last_signal_time.get(key, 0) < TIGHT_COOLDOWN:
                         continue
-                    # a breakout never fires after a fake-out on the same box
-                    if is_break and now_ts - last_signal_time.get(fake_key, 0) < TIGHT_COOLDOWN:
-                        continue
                     b = sig["box"]
-                    # ── BLOCKS: TIGHT BREAKOUT is never blocked (it has been performing).
-                    # TIGHT FAKE-OUT is only blocked while an opposite trade is open. ──
-                    blk = None if is_break else check_blocks(
-                        pair, sig["direction"], sig["entry"], sig["sl"],
-                        h1, h4, m15, liq_ok=False, sr_rule=False, box_rule=False)
-                    if blk:
-                        t_res, t_sup = sr_nearest(h1, h4, sig["entry"])
-                        log_blocked(pair, sig["kind"], sig["direction"], sig["entry"], sig["sl"],
-                                    sig["tps"],
-                                    {"cond": condition, "size": round(b["width"], 1),
-                                     "res": t_res, "sup": t_sup},
-                                    blk[0], blk[1], now_ts, now_str)
-                        continue
                     emoji = "🔴" if sig["direction"] == "SELL" else "🟢"
                     tp_lines = "".join(
                         f"{name:<10}: {price:.4f}  ({pips(sig['entry'], price)} pips)\n"
@@ -1646,49 +1101,7 @@ def scan():
             except Exception as e:
                 print(f"{pair}: tight signal error: {e}")
 
-        # ── CHOP SIGNAL (only when market is choppy) ──────
-        if CHOP_ENABLED and condition == "CHOPPY" and now_ts >= chop_state["paused_until"]:
-            chop = chop_signal(m15, m5, macd_value(h1))
-            chop_key = f"{pair}_chop"
-            # ── BLOCK: opposite trade open ──
-            if chop and now_ts - last_signal_time.get(chop_key, 0) >= signal_cooldown:
-                blk = check_blocks(pair, chop["direction"], chop["entry"], chop["sl"],
-                                   h1, h4, m15)
-                if blk:
-                    log_blocked(pair, "CHOP", chop["direction"], chop["entry"], chop["sl"],
-                                [("TP1", chop["tp1"]), ("TP2", chop["tp2"])],
-                                {"cond": condition,
-                                 "size": round(chop["r_high"] - chop["r_low"], 1)},
-                                blk[0], blk[1], now_ts, now_str)
-                    chop = None
-            if chop and now_ts - last_signal_time.get(chop_key, 0) >= signal_cooldown:
-                emoji = "🔴" if chop["direction"] == "SELL" else "🟢"
-                msg = (
-                    f"{emoji} CHOP SIGNAL — {pair}\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"Direction : {chop['direction']}\n"
-                    f"Entry     : {chop['entry']:.4f}\n"
-                    f"Stop Loss : {chop['sl']:.4f}  ({pips(chop['entry'], chop['sl'])} pips)\n"
-                    f"TP1 (mid) : {chop['tp1']:.4f}  ({pips(chop['entry'], chop['tp1'])} pips)\n"
-                    f"TP2 (edge): {chop['tp2']:.4f}  ({pips(chop['entry'], chop['tp2'])} pips)\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"Setup        : M5 sweep of {chop['swept']} + rejection\n"
-                    f"M15 Range    : {chop['r_low']:.2f} — {chop['r_high']:.2f}\n"
-                    f"R:R (TP2)    : 1:{chop['rr2']}\n"
-                    f"Pip size     : {PIP_SIZE:g}\n"
-                    f"Time         : {now_str}\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"⚠️ Range trade, not a trend trade. Take profit early, size smaller."
-                )
-                send(msg)
-                last_signal_time[chop_key] = now_ts
-                add_trade(pair, "CHOP", chop["direction"], chop["entry"], chop["sl"],
-                          [("TP1", chop["tp1"]), ("TP2", chop["tp2"])],
-                          meta={"cond": condition,
-                                "size": round(chop["r_high"] - chop["r_low"], 1)})
-                print(f"{pair}: CHOP signal sent: {chop['direction']} @ {chop['entry']:.4f}")
-                continue
-
+        # ── BOS TREND SIGNAL (exactly as it was) ──────────
         h4b = bias(h4)
         print(f"{pair} H4: {h4b}")
         if h4b == "NEUTRAL":
@@ -1760,18 +1173,6 @@ def scan():
         liq        = "✅" if liquidity_grab(m15, h4b) else "❌"
         sr_line    = sr_summary(h1, h4, h4b, entry)
 
-        # ── BLOCKS: opposite trade open / inside a tight box / no room to S/R ──
-        blk = check_blocks(pair, direction, entry, sl, h1, h4, m15,
-                           liq_ok=(liq == "✅"), sr_rule=True, box_rule=True)
-        if blk:
-            b_res, b_sup = sr_nearest(h1, h4, entry)
-            log_blocked(pair, "TREND", direction, entry, sl,
-                        [("TP1", tp1), ("TP2", tp2), ("TP3", tp3)],
-                        {"cond": condition, "liq": "yes" if liq == "✅" else "no",
-                         "res": b_res, "sup": b_sup, "h1macd": round(h1_macd, 1)},
-                        blk[0], blk[1], now_ts, now_str)
-            continue
-
         msg = (
             f"{emoji} SIGNAL ALERT — {pair}\n"
             f"━━━━━━━━━━━━━━━━\n"
@@ -1804,13 +1205,14 @@ def scan():
                         "res": res_pts, "sup": sup_pts, "h1macd": round(h1_macd, 1)})
         print(f"{pair}: Signal sent: {direction} @ {entry:.4f}")
 
-# ── MAIN LOOP (started by sweep_bot.py) ───────────────────
+# ── MAIN LOOP ─────────────────────────────────────────────
 def run_kpojime(announce=True):
     print("Kpojime Bot starting...")
     _load_trade_log()
     if announce:
         send(f"🚀 Kpojime Bot STARTED\n"
              f"Scanning {', '.join(PAIRS)} every {SCAN_INTERVAL//60} min.\n"
+             f"Signals: BOS trend + TIGHT BREAKOUT.\n"
              f"Sleeps {SLEEP_START_UTC:02d}:00–{WAKE_UTC:02d}:00 UTC.\n"
              f"Heartbeat every 2 hours.")
     next_scan = 0
@@ -1890,8 +1292,7 @@ def alert(text):
 
 
 def supervise(name, fn):
-    """Run one bot forever. If it crashes, tell Telegram and restart it
-    without touching the other bot."""
+    """Run the bot forever. If it crashes, tell Telegram and restart it."""
     first = True
     while True:
         try:
@@ -1941,7 +1342,7 @@ def start_heartbeat():
 
 
 def main():
-    print("Launcher starting: Kpojime bot (trend + chop + tight)")
+    print("Launcher starting: Kpojime bot (BOS trend + tight breakout)")
     start_health_server()
     start_self_ping()
     start_heartbeat()
