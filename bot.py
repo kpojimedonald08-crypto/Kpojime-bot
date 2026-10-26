@@ -454,41 +454,102 @@ def tight_box(m15):
     width = hi - lo
     if width < TIGHT_MIN_BOX or width > TIGHT_MAX_BOX:
         return None
-    return {"high": hi, "low": lo, "mid": (hi + lo) / 2, "width": width}
+    return {"high": hi, "low": lo, "mid": (hi + lo) / 2, "width": width,
+            "end_t": older[0]["t"]}      # time of the newest candle inside the box
 
-def tight_signals(m15, m5, h1_macd=0.0):
+# ── LOCKED BOX + RANGE CHECK ──────────────────────────────
+# The box used to be recalculated from a rolling window every scan, so its edges
+# drifted (old lows dropped out and a 32-pt box became a 15-pt box). Now the first
+# time a tight box is found it is LOCKED: high and low stay fixed until it breaks,
+# its break goes stale, or TIGHT_LOCK_HOURS pass.
+TIGHT_LOCK_HOURS   = float(os.environ.get("TIGHT_LOCK_HOURS", "4"))
+# In a CHOPPY market (heartbeat says "NO TREND TRADE until breakout") a tight
+# breakout only counts when the broken box edge is at the edge of the 20-candle H1
+# range, the same range the heartbeat shows. TIGHT_RANGE_FILTER=0 turns this off.
+TIGHT_RANGE_FILTER = os.environ.get("TIGHT_RANGE_FILTER", "1") == "1"
+TIGHT_RANGE_TOL    = float(os.environ.get("TIGHT_RANGE_TOL", "10"))   # points from the H1 range edge
+locked_box = {}      # pair -> locked box (never moves while locked)
+
+def _box_break(m15, box):
+    """First M15 close outside the box among the candles that came AFTER the box
+    ended. Returns (side, i) with i = index in m15 (newest first), or None."""
+    hi, lo = box["high"], box["low"]
+    n = 0
+    for c in m15:
+        if c["t"] > box["end_t"]:
+            n += 1
+        else:
+            break
+    for i in range(n - 1, -1, -1):        # oldest -> newest
+        if m15[i]["c"] > hi:
+            return ("UP", i)
+        if m15[i]["c"] < lo:
+            return ("DOWN", i)
+    return None
+
+def get_box(pair, m15):
+    """The box the bot works with: the locked one, or a freshly found one that
+    gets locked now. A locked box is dropped when it is older than
+    TIGHT_LOCK_HOURS or its break is older than the break window (TIGHT_WINDOW)."""
+    box = locked_box.get(pair)
+    if box:
+        brk = _box_break(m15, box)
+        if (time.time() - box["locked_at"] > TIGHT_LOCK_HOURS * 3600
+                or (brk and brk[1] >= TIGHT_WINDOW)):
+            locked_box.pop(pair, None)
+            box = None
+    if box is None:
+        found = tight_box(m15)
+        if found:
+            found["locked_at"] = time.time()
+            found["locked_utc"] = _utcnow().strftime("%H:%M")
+            locked_box[pair] = found
+            box = found
+    return box
+
+def tight_ctx(h4, h1):
+    """(condition, h1_range_low, h1_range_high), same range as the heartbeat."""
+    condition, _, r_high, r_low = market_condition(h4, h1)
+    return condition, r_low, r_high
+
+def tight_range_ok(box, up, ctx):
+    """In a CHOPPY market the broken edge must sit at the H1 range edge."""
+    if not TIGHT_RANGE_FILTER or not ctx:
+        return True
+    condition, r_low, r_high = ctx
+    if condition != "CHOPPY":
+        return True
+    if up:
+        return box["high"] >= r_high - TIGHT_RANGE_TOL
+    return box["low"] <= r_low + TIGHT_RANGE_TOL
+
+def tight_signals(m15, m5, h1_macd=0.0, pair=None, ctx=None):
     """
-    TIGHT BREAKOUT: an M15 candle closed outside the box, no M15 candle has
-      closed back inside since, and an M5 candle retested the broken edge and
+    TIGHT BREAKOUT: an M15 candle closed outside the (locked) box, no M15 candle
+      has closed back inside since, and an M5 candle retested the broken edge and
       closed away from it in the break direction.
     Uses candles already fetched for the BOS scan (no extra API calls).
     Returns a list of signal dicts (usually empty).
     """
-    box = tight_box(m15)
+    box = get_box(pair, m15)
     if not box or not m5 or len(m5) < 3 or len(m15) < TIGHT_WINDOW:
         return []
     hi, lo, mid, width = box["high"], box["low"], box["mid"], box["width"]
 
-    win   = m15[:TIGHT_WINDOW]            # newest first
     entry = m5[0]["c"]
     last5 = m5[:3]
     bullish_m5 = m5[0]["c"] > m5[0]["o"]
     bearish_m5 = m5[0]["c"] < m5[0]["o"]
 
-    # first (oldest) M15 close outside the box inside the window
-    brk = None
-    for i in range(len(win) - 1, -1, -1):
-        if win[i]["c"] > hi:
-            brk = ("UP", i)
-            break
-        if win[i]["c"] < lo:
-            brk = ("DOWN", i)
-            break
-    if not brk:
-        return []
+    # first (oldest) M15 close outside the box, after the box ended
+    brk = _box_break(m15, box)
+    if not brk or brk[1] >= TIGHT_WINDOW:
+        return []                         # no break, or the break is too old
     side, i = brk
     up = side == "UP"
-    since_break = win[:i + 1]             # break candle and everything after it
+    if not tight_range_ok(box, up, ctx):
+        return []                         # choppy market: not at the H1 range edge
+    since_break = m15[:i + 1]             # break candle and everything after it
 
     held = all((c["c"] > hi) if up else (c["c"] < lo) for c in since_break)
     if not held:
@@ -736,7 +797,7 @@ def process_candle(t, c):
             hit_px = c["l"] if t["direction"] == "BUY" else c["h"]
             say(f"❌ STOP LOSS HIT — {head}\n"
                 f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.\n"
-                f"Hit at: {c['t'][:16]} UTC\n"
+                f"Detected at: {_utcnow():%Y-%m-%d %H:%M} UTC\n"
                 f"Price reached: {hit_px:.2f}")
             log_trade(t, "SL")
         return True
@@ -953,26 +1014,21 @@ def _early_trend(pair, h4, h1, m15, m5, now_ts, now_str):
              f"Time: {now_str}")
 
 
-def _early_tight(pair, h1, m15, m5, now_ts, now_str):
+def _early_tight(pair, h1, m15, m5, now_ts, now_str, ctx=None):
     """WATCH (box formed) and READY (break closed, waiting for M5 retest) for TIGHT BREAKOUT."""
     if not (TIGHT_ENABLED and EARLY_TIGHT) or not m5 or len(m5) < 3:
         return
-    box = tight_box(m15)
+    box = get_box(pair, m15)
     if not box:
         return
-    if tight_signals(m15, m5, macd_value(h1)):
+    if tight_signals(m15, m5, macd_value(h1), pair, ctx):
         return                      # a real tight signal is firing or on cooldown
     hi, lo = box["high"], box["low"]
     tag = f"{hi:.1f}-{lo:.1f}"
-    win = m15[:TIGHT_WINDOW]
-    brk = None
-    for i in range(len(win) - 1, -1, -1):
-        if win[i]["c"] > hi:
-            brk = ("UP", i)
-            break
-        if win[i]["c"] < lo:
-            brk = ("DOWN", i)
-            break
+    rng = f"H1 range : {ctx[1]:.2f} — {ctx[2]:.2f}\n" if ctx and ctx[0] != "UNKNOWN" else ""
+    brk = _box_break(m15, box)
+    if brk and brk[1] >= TIGHT_WINDOW:
+        brk = None                  # break too old to trade
 
     if not brk:
         # No WATCH while a real signal is open on this pair, and only one WATCH
@@ -982,6 +1038,8 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
             send(f"👀 WATCH — TIGHT box formed — {pair}\n"
                  f"━━━━━━━━━━━━━━━━\n"
                  f"Box : {lo:.2f} — {hi:.2f}  ({box['width']:.1f} pts)\n"
+                 f"Box locked at: {box.get('locked_utc', '?')} UTC\n"
+                 f"{rng}"
                  f"Price: {m5[0]['c']:.2f}\n"
                  f"A breakout above {hi:.2f} or below {lo:.2f} can follow.\n"
                  f"Not an entry.\nTime: {now_str}")
@@ -989,7 +1047,9 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
 
     side, i = brk
     up = side == "UP"
-    held = all((c["c"] > hi) if up else (c["c"] < lo) for c in win[:i + 1])
+    if not tight_range_ok(box, up, ctx):
+        return                      # choppy market, not at the H1 range edge: no READY
+    held = all((c["c"] > hi) if up else (c["c"] < lo) for c in m15[:i + 1])
     if not held:
         return                      # failed break: nothing to wait for
     edge = hi if up else lo
@@ -997,6 +1057,7 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
         send(f"🟠 READY — TIGHT BREAKOUT {'BUY' if up else 'SELL'} — {pair}\n"
              f"━━━━━━━━━━━━━━━━\n"
              f"M15 closed {'above' if up else 'below'} the box ({lo:.2f} — {hi:.2f}).\n"
+             f"{rng}"
              f"Price: {m5[0]['c']:.2f}\n"
              f"Fires when M5 retests within {TIGHT_RETEST_TOL:g} pts of {edge:.2f} "
              f"and closes {'bullish' if up else 'bearish'}.\n"
@@ -1019,7 +1080,7 @@ def early_alerts(pair, h4, h1, m15, m5, now_ts, now_str):
     except Exception as e:
         print(f"{pair}: early trend alert error: {e}")
     try:
-        _early_tight(pair, h1, m15, m5, now_ts, now_str)
+        _early_tight(pair, h1, m15, m5, now_ts, now_str, tight_ctx(h4, h1))
     except Exception as e:
         print(f"{pair}: early tight alert error: {e}")
 
@@ -1365,7 +1426,8 @@ def scan():
         # Never skips the rest of the scan, so the BOS signal below runs as usual.
         if TIGHT_ENABLED:
             try:
-                for sig in tight_signals(m15, m5, macd_value(h1)):
+                for sig in tight_signals(m15, m5, macd_value(h1), pair,
+                                         (condition, r_low, r_high)):
                     key = f"{pair}_tight_break"
                     if now_ts - last_signal_time.get(key, 0) < TIGHT_COOLDOWN:
                         continue
@@ -1385,6 +1447,8 @@ def scan():
                         f"━━━━━━━━━━━━━━━━\n"
                         f"Setup        : {sig['setup']}\n"
                         f"Tight box    : {b['low']:.2f} — {b['high']:.2f}  ({b['width']:.1f} pts)\n"
+                        f"Box locked at: {b.get('locked_utc', '?')} UTC\n"
+                        f"H1 range     : {r_low:.2f} — {r_high:.2f}  ({condition})\n"
                         f"R:R (TP2)    : 1:{sig['rr2']}\n"
                         f"Pip size     : {PIP_SIZE:g}\n"
                         f"Time         : {now_str}\n"
