@@ -733,8 +733,11 @@ def process_candle(t, c):
                 f"If you moved SL to entry, you're out at ~0R.")
             log_trade(t, "BE")
         else:
+            hit_px = c["l"] if t["direction"] == "BUY" else c["h"]
             say(f"❌ STOP LOSS HIT — {head}\n"
-                f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.")
+                f"SL {t['sl']:.4f} touched (-1R, -{pips(t['entry'], t['sl'])} pips). Trade closed.\n"
+                f"Hit at: {c['t'][:16]} UTC\n"
+                f"Price reached: {hit_px:.2f}")
             log_trade(t, "SL")
         return True
 
@@ -811,6 +814,23 @@ def _early_ok(key, cooldown):
     if now - early_sent.get(key, 0) < cooldown:
         return False
     early_sent[key] = now
+    return True
+
+
+# TIGHT WATCH limiter: the box is a rolling window, so its edges drift a little
+# every 15 minutes. Only send a new WATCH when an edge has moved more than
+# TIGHT_WATCH_MOVE points since the last WATCH, or the cooldown has passed.
+TIGHT_WATCH_MOVE = float(os.environ.get("TIGHT_WATCH_MOVE", "5"))  # points
+last_tight_watch = {}
+
+
+def _tight_watch_ok(pair, hi, lo):
+    last = last_tight_watch.get(pair)
+    if last and time.time() - last["t"] < TIGHT_COOLDOWN \
+            and abs(hi - last["hi"]) <= TIGHT_WATCH_MOVE \
+            and abs(lo - last["lo"]) <= TIGHT_WATCH_MOVE:
+        return False
+    last_tight_watch[pair] = {"t": time.time(), "hi": hi, "lo": lo}
     return True
 
 
@@ -955,7 +975,10 @@ def _early_tight(pair, h1, m15, m5, now_ts, now_str):
             break
 
     if not brk:
-        if _early_ok((pair, "TIGHT WATCH", tag), TIGHT_COOLDOWN):
+        # No WATCH while a real signal is open on this pair, and only one WATCH
+        # per box unless an edge has moved more than TIGHT_WATCH_MOVE points.
+        live = any(t["pair"] == pair and not t.get("shadow") for t in active_trades)
+        if not live and _tight_watch_ok(pair, hi, lo):
             send(f"👀 WATCH — TIGHT box formed — {pair}\n"
                  f"━━━━━━━━━━━━━━━━\n"
                  f"Box : {lo:.2f} — {hi:.2f}  ({box['width']:.1f} pts)\n"
